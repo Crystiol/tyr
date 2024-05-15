@@ -1,1 +1,3 @@
-1234567
+https://github.com/Crystiol/tyr.git
+
+QMAKE_LFLAGS += -Wl,--stack=16777216
