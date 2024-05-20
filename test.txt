@@ -1,1 +1,211 @@
-885522999
+VTK7.1
+1、
+class VTKINTERACTIONSTYLE_EXPORT vtkInteractorStyleTrackballCamera : public vtkInteractorStyle
+{
+}
+
+2、
+class VTKINTERACTIONSTYLE_EXPORT vtkInteractorStyleMultiTouchCamera : public vtkInteractorStyleTrackballCamera
+{
+	virtual void OnRotate();
+	virtual void OnPinch();
+	virtual void OnPan();
+}
+
+VTK9.3
+1、
+class VTKINTERACTIONSTYLE_EXPORT vtkInteractorStyleTrackballCamera : public vtkInteractorStyle
+{
+	
+}
+
+2、
+class VTKINTERACTIONSTYLE_EXPORT vtkInteractorStyleMultiTouchCamera : public vtkInteractorStyleTrackballCamera
+{
+	void OnStartRotate() override;
+	void OnRotate() override;
+	void OnEndRotate() override;
+	
+	void OnStartPinch() override;
+	void OnPinch() override;
+	void OnEndPinch() override;
+	
+	void OnStartPan() override;
+	void OnPan() override;
+	void OnEndPan() override;
+}
+
+
+#include <QApplication>
+#include <QMainWindow>
+#include <QVTKWidget.h>
+#include <vtkRenderWindow.h>
+#include <vtkRenderer.h>
+#include <vtkSmartPointer.h>
+#include <vtkCubeSource.h>
+#include <vtkPolyDataMapper.h>
+#include <vtkActor.h>
+#include <vtkInteractorStyleTrackballCamera.h>
+#include <QTouchEvent>
+#include <QPinchGesture>
+#include <QGestureEvent>
+#include <QPanGesture>
+#include <QSwipeGesture>
+#include <QDialog>
+#include <QVBoxLayout>
+#include <QLabel>
+
+class SettingsDialog : public QDialog {
+public:
+    SettingsDialog(QWidget* parent = nullptr) : QDialog(parent) {
+        QVBoxLayout* layout = new QVBoxLayout(this);
+        QLabel* label = new QLabel("Settings", this);
+        layout->addWidget(label);
+        setLayout(layout);
+        setWindowTitle("Settings");
+        resize(200, 100);
+    }
+};
+
+class TouchVTKWidget : public QVTKWidget {
+    Q_OBJECT
+
+public:
+    TouchVTKWidget(QWidget* parent = nullptr) : QVTKWidget(parent) {
+        setAttribute(Qt::WA_AcceptTouchEvents);
+        grabGesture(Qt::PinchGesture);
+        grabGesture(Qt::PanGesture);
+        grabGesture(Qt::SwipeGesture);
+    }
+
+protected:
+    bool event(QEvent* event) override {
+        if (event->type() == QEvent::Gesture) {
+            return gestureEvent(static_cast<QGestureEvent*>(event));
+        }
+        return QVTKWidget::event(event);
+    }
+
+private:
+    bool gestureEvent(QGestureEvent* event) {
+        if (QGesture* pinch = event->gesture(Qt::PinchGesture)) {
+            handlePinchGesture(static_cast<QPinchGesture*>(pinch));
+        }
+        if (QGesture* pan = event->gesture(Qt::PanGesture)) {
+            handlePanGesture(static_cast<QPanGesture*>(pan));
+        }
+        if (QGesture* swipe = event->gesture(Qt::SwipeGesture)) {
+            handleSwipeGesture(static_cast<QSwipeGesture*>(swipe));
+        }
+        return true;
+    }
+
+    void handlePinchGesture(QPinchGesture* gesture) {
+        vtkRenderer* renderer = this->GetRenderWindow()->GetRenderers()->GetFirstRenderer();
+        vtkCamera* camera = renderer->GetActiveCamera();
+
+        if (gesture->state() == Qt::GestureStarted || gesture->state() == Qt::GestureUpdated) {
+            double scaleFactor = gesture->scaleFactor();
+            if (scaleFactor > 1.0) {
+                camera->Dolly(1.1);
+            } else {
+                camera->Dolly(0.9);
+            }
+            renderer->ResetCameraClippingRange();
+            this->GetRenderWindow()->Render();
+        }
+    }
+
+    void handlePanGesture(QPanGesture* gesture) {
+        vtkRenderer* renderer = this->GetRenderWindow()->GetRenderers()->GetFirstRenderer();
+        vtkCamera* camera = renderer->GetActiveCamera();
+
+        QPointF delta = gesture->delta();
+        double panFactor = 0.1;  // 平移因子，根据需要调整
+
+        // 获取当前相机位置和焦点
+        double position[3];
+        double focalPoint[3];
+        camera->GetPosition(position);
+        camera->GetFocalPoint(focalPoint);
+
+        // 计算新的相机位置和焦点
+        position[0] -= delta.x() * panFactor;
+        position[1] += delta.y() * panFactor;
+        focalPoint[0] -= delta.x() * panFactor;
+        focalPoint[1] += delta.y() * panFactor;
+
+        camera->SetPosition(position);
+        camera->SetFocalPoint(focalPoint);
+        renderer->ResetCameraClippingRange();
+        this->GetRenderWindow()->Render();
+    }
+
+    void handleSwipeGesture(QSwipeGesture* gesture) {
+        vtkRenderer* renderer = this->GetRenderWindow()->GetRenderers()->GetFirstRenderer();
+        vtkCamera* camera = renderer->GetActiveCamera();
+
+        // 获取手势的起始位置
+        QGesture* baseGesture = gesture->gestureType() == Qt::SwipeGesture ? gesture : nullptr;
+        if (!baseGesture) return;
+
+        // 假设屏幕左侧边缘为100像素以内
+        const int edgeThreshold = 100;
+        QPointF startPosition = baseGesture->hotSpot();
+
+        if (startPosition.x() > edgeThreshold) {
+            return;  // 不是从左侧边缘开始的手势，不做处理
+        }
+
+        if (gesture->state() == Qt::GestureFinished) {
+            if (gesture->horizontalDirection() == QSwipeGesture::Left) {
+                camera->Azimuth(-10);  // 向左旋转
+            } else if (gesture->horizontalDirection() == QSwipeGesture::Right) {
+                camera->Azimuth(10);  // 向右旋转
+            }
+            if (gesture->verticalDirection() == QSwipeGesture::Up) {
+                camera->Elevation(10);  // 向上旋转
+            } else if (gesture->verticalDirection() == QSwipeGesture::Down) {
+                camera->Elevation(-10);  // 向下旋转
+            }
+            renderer->ResetCameraClippingRange();
+            this->GetRenderWindow()->Render();
+
+            // 弹出设置窗口
+            if (gesture->horizontalDirection() == QSwipeGesture::Right) {
+                SettingsDialog* settingsDialog = new SettingsDialog(this);
+                settingsDialog->exec();
+            }
+        }
+    }
+};
+
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+
+public:
+    MainWindow() {
+        TouchVTKWidget* vtkWidget = new TouchVTKWidget(this);
+        setCentralWidget(vtkWidget);
+
+        vtkSmartPointer<vtkRenderer> renderer = vtkSmartPointer<vtkRenderer>::New();
+        vtkWidget->GetRenderWindow()->AddRenderer(renderer);
+
+        vtkSmartPointer<vtkCubeSource> cubeSource = vtkSmartPointer<vtkCubeSource>::New();
+        vtkSmartPointer<vtkPolyDataMapper> mapper = vtkSmartPointer<vtkPolyDataMapper>::New();
+        mapper->SetInputConnection(cubeSource->GetOutputPort());
+
+        vtkSmartPointer<vtkActor> actor = vtkSmartPointer<vtkActor>::New();
+        actor->SetMapper(mapper);
+
+        renderer->AddActor(actor);
+        renderer->ResetCamera();
+    }
+};
+
+int main(int argc, char** argv) {
+    QApplication app(argc, argv);
+    MainWindow mainWindow;
+    mainWindow.show();
+    return app.exec();
+}
