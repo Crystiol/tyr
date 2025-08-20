@@ -141,13 +141,16 @@ public:
   BufferPoolBase(size_t block_size, size_t total_blocks) : bs_(block_size) {
     storage_.resize(total_blocks);
     backing_.resize(total_blocks * block_size);
+    for (size_t i = 0; i < total_blocks; ++i)
+      storage_.emplace_back(std::make_unique<BufferBlock>());
+
     for (size_t i = 0; i < total_blocks; ++i) {
-      storage_[i].cap = bs_;
-      storage_[i].data = &backing_[i * bs_];
-      storage_[i].refcount.store(0, std::memory_order_relaxed);
-      storage_[i].next = (i + 1 < total_blocks ? &storage_[i + 1] : nullptr);
+      storage_[i]->cap = bs_;
+      storage_[i]->data = &backing_[i * bs_];
+      storage_[i]->refcount.store(0, std::memory_order_relaxed);
+      storage_[i]->next = (i + 1 < total_blocks ? storage_[i + 1].get() : nullptr);
     }
-    freelist_.store(&storage_[0], std::memory_order_release);
+    freelist_.store(storage_[0].get(), std::memory_order_release);
   }
   BufferBlock *acquire() {
     BufferBlock *h = freelist_.load(std::memory_order_acquire);
@@ -178,7 +181,7 @@ public:
 
 private:
   size_t bs_;
-  std::vector<BufferBlock> storage_;
+  std::vector<std::unique_ptr<BufferBlock>> storage_;
   std::vector<uint8_t> backing_;
   std::atomic<BufferBlock *> freelist_;
 };
@@ -214,8 +217,9 @@ public:
   explicit MPMCRing(size_t cap_pow2) : size_(cap_pow2), mask_(cap_pow2 - 1) {
     assert((cap_pow2 & (cap_pow2 - 1)) == 0);
     entries_.resize(size_);
-    for (size_t i = 0; i < size_; ++i)
-      entries_[i].seq.store(i, std::memory_order_relaxed);
+    for (size_t i = 0; i < size_; ++i) {
+      entries_.emplace_back(std::make_unique<Entry>(i));
+    }
     head_.store(0);
     tail_.store(0);
   }
@@ -223,7 +227,7 @@ public:
     Entry *e;
     size_t pos = head_.load(std::memory_order_relaxed);
     for (;;) {
-      e = &entries_[pos & mask_];
+      e = entries_[pos & mask_].get();
       size_t seq = e->seq.load(std::memory_order_acquire);
       intptr_t dif = (intptr_t)seq - (intptr_t)pos;
       if (dif == 0) {
@@ -243,7 +247,7 @@ public:
     Entry *e;
     size_t pos = tail_.load(std::memory_order_relaxed);
     for (;;) {
-      e = &entries_[pos & mask_];
+      e = entries_[pos & mask_].get();
       size_t seq = e->seq.load(std::memory_order_acquire);
       intptr_t dif = (intptr_t)seq - (intptr_t)(pos + 1);
       if (dif == 0) {
@@ -264,8 +268,9 @@ private:
   struct Entry {
     std::atomic<size_t> seq;
     T val;
+    Entry(size_t s) : seq(s), val() {}
   };
-  std::vector<Entry> entries_;
+  std::vector<std::unique_ptr<Entry>> entries_;
   size_t size_, mask_;
   alignas(64) std::atomic<size_t> head_, tail_;
 };
@@ -564,13 +569,13 @@ public:
         slot_mask_(slots_ - 1), initialized_(false), last_slot_index_(0) {
     slots_q_.reserve(slots_);
     for (size_t i = 0; i < slots_; ++i)
-      slots_q_.emplace_back(1 << 14);
+      slots_q_.emplace_back(std::make_unique<MPMCRing<Entry>>(1 << 14));
   }
   inline void add(int fd, uint64_t expire_ms) {
     Entry e{fd, expire_ms};
     size_t idx = slot_index(expire_ms);
     for (int i = 0; i < 64; ++i) {
-      if (slots_q_[idx].enqueue(e))
+      if (slots_q_[idx]->enqueue(e))
         return;
       std::this_thread::yield();
     }
@@ -596,7 +601,7 @@ public:
 private:
   template <typename F> void drain(size_t idx, uint64_t now_ms, F &on_timeout) {
     Entry e;
-    while (slots_q_[idx].dequeue(e)) {
+    while (slots_q_[idx]->dequeue(e)) {
       if (e.expire_ms <= now_ms)
         on_timeout(e.fd);
       else
@@ -607,7 +612,7 @@ private:
   void drain_light(size_t idx, uint64_t now_ms, F &on_timeout) {
     Entry e;
     for (int k = 0; k < 64; ++k) {
-      if (!slots_q_[idx].dequeue(e))
+      if (!slots_q_[idx]->dequeue(e))
         break;
       if (e.expire_ms <= now_ms)
         on_timeout(e.fd);
@@ -626,7 +631,7 @@ private:
   }
   const uint64_t tick_ms_;
   const size_t slots_, slot_mask_;
-  std::vector<MPMCRing<Entry>> slots_q_;
+  std::vector<std::unique_ptr<MPMCRing<Entry>>> slots_q_;
   std::atomic<bool> initialized_;
   std::atomic<size_t> last_slot_index_;
 };
