@@ -127,8 +127,7 @@ static inline uint32_t crc32_calc(const void *data, size_t len) {
 }
 static inline uint32_t bswap32_u32(uint32_t v) { return __builtin_bswap32(v); }
 
-// -------------------------- BufferBlock & 双层 BufferPool
-// --------------------------
+// -------------------------- BufferBlock & 双层 BufferPool --------------------------
 struct BufferBlock {
   std::atomic<int> refcount;
   BufferBlock *next;
@@ -210,8 +209,7 @@ private:
   BufferPoolBase large_;
 };
 
-// -------------------------- MPMC 环形队列（用于工作队列 / timingwheel）
-// --------------------------
+// -------------------------- MPMC 环形队列（用于工作队列 / timingwheel） --------------------------
 template <typename T> class MPMCRing {
 public:
   explicit MPMCRing(size_t cap_pow2) : size_(cap_pow2), mask_(cap_pow2 - 1) {
@@ -294,8 +292,7 @@ struct PacketHeader {
   uint32_t hdr_crc;
 };
 
-// -------------------------- RingBuffer（零拷贝入站，支持双层块）
-// --------------------------
+// -------------------------- RingBuffer（零拷贝入站，支持双层块） --------------------------
 class RingBuffer {
 public:
   RingBuffer(DualBufferPool &pool)
@@ -390,17 +387,18 @@ public:
     }
     return cnt;
   }
-  struct StealEntry {
-    BufferBlock *blk;
-    size_t offset;
-    size_t len;
-  };
-  // steal_body_after: 在 header_len 之后“窃取” body_len 的块，返回多个
-  // StealEntry（零拷贝）
-  bool steal_body_after(size_t header_len, size_t body_len,
-                        std::vector<StealEntry> &out) {
+  // 修改后的 steal_body_after: 返回新 BufferBlock*，拷贝数据，按 body_len 选择小/大块
+  BufferBlock* steal_body_after(size_t header_len, size_t body_len) {
     if (readable_bytes() < header_len + body_len)
-      return false;
+      return nullptr;
+
+    // 决定块大小
+    size_t block_size = (body_len <= SMALL_BLOCK) ? SMALL_BLOCK : LARGE_BLOCK;
+    BufferBlock* new_block = pool_.acquire(block_size);
+    if (!new_block)
+      return nullptr;
+
+    // 推进到 header_len 后
     BufferBlock *cur = head_;
     size_t off = head_off_;
     size_t skip = header_len;
@@ -415,14 +413,15 @@ public:
       cur = cur->next;
       off = 0;
     }
+
+    // 拷贝 body_len 到 new_block->data
     size_t remain = body_len;
-    std::vector<BufferBlock *> keep;
+    size_t copied = 0;
     while (remain > 0 && cur) {
       size_t avail = (cur == tail_) ? (tail_off_ - off) : (cur->cap - off);
       size_t take = std::min(avail, remain);
-      out.push_back({cur, off, take});
-      if (keep.empty() || keep.back() != cur)
-        keep.push_back(cur);
+      memcpy(new_block->data + copied, cur->data + off, take);
+      copied += take;
       remain -= take;
       off += take;
       if (off >= cur->cap) {
@@ -430,10 +429,9 @@ public:
         off = 0;
       }
     }
-    for (BufferBlock *b : keep)
-      pool_.retain(b);
+
     consume(header_len + body_len);
-    return true;
+    return new_block;
   }
 
 private:
@@ -652,15 +650,10 @@ private:
 };
 
 static inline void
-business_worker_echo(int fd, std::vector<RingBuffer::StealEntry> &stolen,
-                     TaskQueue &reactor_queue) {
-  // 示例业务：echo（零拷贝）
+business_worker_echo(int fd, BufferBlock* stolen_block, size_t body_len, TaskQueue &reactor_queue) {
   ResponseTask t;
   t.fd = fd;
-  t.entries.reserve(stolen.size());
-  for (auto &s : stolen) {
-    t.entries.push_back({s.blk, s.offset, s.len});
-  }
+  t.entries.push_back({stolen_block, 0, body_len});
   while (!reactor_queue.enqueue(t))
     std::this_thread::yield();
 }
@@ -937,19 +930,17 @@ private:
       (void)conn->rx->writable_region(std::min<size_t>(
           LARGE_BLOCK, std::max<size_t>(SMALL_BLOCK, hdr.body_len)));
 
-      // steal body 零拷贝
-      std::vector<RingBuffer::StealEntry> stolen;
-      if (!conn->rx->steal_body_after(0, hdr.body_len, stolen)) {
+      // steal body 拷贝到新块
+      BufferBlock* stolen = conn->rx->steal_body_after(0, hdr.body_len);
+      if (!stolen) {
         g_metrics.drops++;
         break;
       }
       g_metrics.rx_pkts++;
 
       // 把工作投递给 worker（示例：echo）
-      auto job = [fd = conn->fd, stolen = std::move(stolen), this]() mutable {
-        business_worker_echo(
-            fd, const_cast<std::vector<RingBuffer::StealEntry> &>(stolen),
-            taskq_);
+      auto job = [fd = conn->fd, stolen, body_len = hdr.body_len, this]() {
+        business_worker_echo(fd, stolen, body_len, taskq_);
       };
       workers_.submit(job);
     }
