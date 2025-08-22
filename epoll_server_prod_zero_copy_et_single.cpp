@@ -1,10 +1,10 @@
 // epoll_server_prod_zero_copy_et_opt.cpp
 // 单文件高性能零拷贝 Epoll 服务器（全 ET / 批量 accept / 双层 BufferPool）
-// - 完整实现：BufferPool / RingBuffer / Connection / Reactor / WorkerPool /
-// TimingWheel / metrics
+// - 完整实现：BufferPool / RingBuffer / Connection / Reactor / WorkerPool / TimingWheel / metrics
 // - 关键位置已标注 [ET-CRITICAL]
-// 编译： g++ -std=c++11 -O2 epoll_server_prod_zero_copy_et_opt.cpp -lpthread -o
-// server
+// - 修正：保留 business_worker_echo 原始签名，添加 ConnectionPool 和 RingBufferPool 对象池，
+//         将 Connection::out_ring 从 std::vector<OutEntry> 改为单一 BufferBlock*，优化大包并减少碎片
+// 编译：g++ -std=c++11 -O2 epoll_server_prod_zero_copy_et_opt.cpp -lpthread -o server
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -44,8 +44,7 @@ using namespace std::chrono;
 
 // -------------------------- 基础工具 & 日志 --------------------------
 static uint64_t now_ms() {
-    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch())
-            .count();
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
 #define LOG_INFO(fmt, ...) fprintf(stdout, "[INFO] " fmt "\n", ##__VA_ARGS__)
@@ -77,7 +76,7 @@ static inline int set_tcp_options(int fd) {
 static const size_t SMALL_BLOCK = 512; // 小块：协议头或小包
 static const size_t LARGE_BLOCK = 4096; // 大块：主体或大包
 static const int MAX_ACCEPT_BATCH = 64; // 每次 accept 最多尝试次数
-static const size_t OUT_RING_CAP = 1024; // 每连接出站环容量
+static const size_t OUT_BUFFER_CAP = LARGE_BLOCK; // 出站缓冲区容量（单一 BufferBlock）
 static const uint64_t DEFAULT_IDLE_MS = 60 * 1000;
 static const uint64_t DEFAULT_ACTIVE_MS = 5 * 60 * 1000;
 
@@ -99,15 +98,15 @@ static std::string metrics_text() {
                      "server_drops %llu\n"
                      "server_parse_errors %llu\n"
                      "server_timeouts %llu\n",
-                     (unsigned long long) g_metrics.accepted.load(),
-                     (unsigned long long) g_metrics.closed.load(),
-                     (unsigned long long) g_metrics.rx_bytes.load(),
-                     (unsigned long long) g_metrics.tx_bytes.load(),
-                     (unsigned long long) g_metrics.rx_pkts.load(),
-                     (unsigned long long) g_metrics.tx_pkts.load(),
-                     (unsigned long long) g_metrics.drops.load(),
-                     (unsigned long long) g_metrics.parse_errors.load(),
-                     (unsigned long long) g_metrics.timeouts.load());
+                     (unsigned long long)g_metrics.accepted.load(),
+                     (unsigned long long)g_metrics.closed.load(),
+                     (unsigned long long)g_metrics.rx_bytes.load(),
+                     (unsigned long long)g_metrics.tx_bytes.load(),
+                     (unsigned long long)g_metrics.rx_pkts.load(),
+                     (unsigned long long)g_metrics.tx_pkts.load(),
+                     (unsigned long long)g_metrics.drops.load(),
+                     (unsigned long long)g_metrics.parse_errors.load(),
+                     (unsigned long long)g_metrics.timeouts.load());
     return std::string(buf, n);
 }
 
@@ -125,7 +124,7 @@ static inline uint32_t crc32_calc(const void *data, size_t len) {
         init = true;
     }
     uint32_t c = 0xFFFFFFFFu;
-    const uint8_t *p = (const uint8_t *) data;
+    const uint8_t *p = (const uint8_t *)data;
     for (size_t i = 0; i < len; ++i)
         c = table[(c ^ p[i]) & 0xFFu] ^ (c >> 8);
     return c ^ 0xFFFFFFFFu;
@@ -190,7 +189,7 @@ public:
 
 private:
     size_t bs_;
-    std::vector<std::unique_ptr<BufferBlock> > storage_;
+    std::vector<std::unique_ptr<BufferBlock>> storage_;
     std::vector<uint8_t> backing_;
     std::atomic<BufferBlock *> freelist_;
 };
@@ -201,7 +200,6 @@ public:
         : small_(SMALL_BLOCK, small_blocks), large_(LARGE_BLOCK, large_blocks) {
     }
 
-    // 根据期望大小尝试分配：优先小块，回退到大块
     BufferBlock *acquire(size_t expect) {
         if (expect <= small_.block_size()) {
             if (auto b = small_.acquire())
@@ -243,7 +241,7 @@ public:
         for (;;) {
             e = entries_[pos & mask_].get();
             size_t seq = e->seq.load(std::memory_order_acquire);
-            intptr_t dif = (intptr_t) seq - (intptr_t) pos;
+            intptr_t dif = (intptr_t)seq - (intptr_t)pos;
             if (dif == 0) {
                 if (head_.compare_exchange_weak(pos, pos + 1)) {
                     e->val = v;
@@ -264,7 +262,7 @@ public:
         for (;;) {
             e = entries_[pos & mask_].get();
             size_t seq = e->seq.load(std::memory_order_acquire);
-            intptr_t dif = (intptr_t) seq - (intptr_t) (pos + 1);
+            intptr_t dif = (intptr_t)seq - (intptr_t)(pos + 1);
             if (dif == 0) {
                 if (tail_.compare_exchange_weak(pos, pos + 1)) {
                     out = e->val;
@@ -284,11 +282,10 @@ private:
         std::atomic<size_t> seq;
         T val;
 
-        Entry(size_t s) : seq(s), val() {
-        }
+        Entry(size_t s) : seq(s), val() {}
     };
 
-    std::vector<std::unique_ptr<Entry> > entries_;
+    std::vector<std::unique_ptr<Entry>> entries_;
     size_t size_, mask_;
     alignas(64) std::atomic<size_t> head_, tail_;
 };
@@ -296,8 +293,7 @@ private:
 template<typename T>
 class WorkQueueWrapper {
 public:
-    WorkQueueWrapper() : q_(1 << 12) {
-    }
+    WorkQueueWrapper() : q_(1 << 12) {}
 
     bool push(const T &v) { return q_.enqueue(v); }
     bool pop(T &o) { return q_.dequeue(o); }
@@ -321,8 +317,7 @@ struct PacketHeader {
 class RingBuffer {
 public:
     RingBuffer(DualBufferPool &pool)
-        : pool_(pool), head_(nullptr), tail_(nullptr), head_off_(0),
-          tail_off_(0) {
+        : pool_(pool), head_(nullptr), tail_(nullptr), head_off_(0), tail_off_(0) {
         append_block(SMALL_BLOCK);
     }
 
@@ -334,6 +329,18 @@ public:
             cur = nxt;
         }
         head_ = tail_ = nullptr;
+    }
+
+    void reset() {
+        BufferBlock *cur = head_;
+        while (cur) {
+            BufferBlock *nxt = cur->next;
+            pool_.release_ref(cur);
+            cur = nxt;
+        }
+        head_ = tail_ = nullptr;
+        head_off_ = tail_off_ = 0;
+        append_block(SMALL_BLOCK);
     }
 
     // 获取可写区域（hint 参数决定分配小/大块）
@@ -380,8 +387,7 @@ public:
     void consume(size_t n) {
         size_t remain = n;
         while (remain > 0 && head_) {
-            size_t avail =
-                    (head_ == tail_) ? (tail_off_ - head_off_) : (head_->cap - head_off_);
+            size_t avail = (head_ == tail_) ? (tail_off_ - head_off_) : (head_->cap - head_off_);
             if (avail > remain) {
                 head_off_ += remain;
                 return;
@@ -419,7 +425,7 @@ public:
         return cnt;
     }
 
-    // 修改后的 steal_body_after: 返回新 BufferBlock*，拷贝数据，按 body_len 选择小/大块
+    // 返回单一 BufferBlock，拷贝数据，按 body_len 选择小/大块
     BufferBlock *steal_body_after(size_t header_len, size_t body_len) {
         if (readable_bytes() < header_len + body_len)
             return nullptr;
@@ -466,6 +472,9 @@ public:
         return new_block;
     }
 
+    std::atomic<int> refcount{0};
+    RingBuffer *next = nullptr;
+
 private:
     DualBufferPool &pool_;
     BufferBlock *head_;
@@ -495,6 +504,49 @@ private:
     }
 };
 
+// -------------------------- RingBufferPool --------------------------
+class RingBufferPool {
+public:
+    RingBufferPool(size_t total, DualBufferPool &dp) : dp_(dp) {
+        storage_.resize(total);
+        for (size_t i = 0; i < total; ++i) {
+            storage_[i] = std::make_unique<RingBuffer>(dp_);
+            storage_[i]->next = (i + 1 < total ? storage_[i + 1].get() : nullptr);
+        }
+        freelist_.store(storage_[0].get(), std::memory_order_release);
+    }
+
+    RingBuffer *acquire() {
+        RingBuffer *h = freelist_.load(std::memory_order_acquire);
+        while (h) {
+            RingBuffer *nxt = h->next;
+            if (freelist_.compare_exchange_weak(h, nxt, std::memory_order_acq_rel)) {
+                h->next = nullptr;
+                h->refcount.store(1, std::memory_order_relaxed);
+                return h;
+            }
+        }
+        return nullptr;
+    }
+
+    void release_ref(RingBuffer *b) {
+        int prev = b->refcount.fetch_sub(1, std::memory_order_acq_rel);
+        if (prev == 1) {
+            b->reset();
+            RingBuffer *head = freelist_.load(std::memory_order_relaxed);
+            do {
+                b->next = head;
+            } while (!freelist_.compare_exchange_weak(
+                head, b, std::memory_order_release, std::memory_order_relaxed));
+        }
+    }
+
+private:
+    DualBufferPool &dp_;
+    std::vector<std::unique_ptr<RingBuffer>> storage_;
+    std::atomic<RingBuffer *> freelist_;
+};
+
 // -------------------------- OutEntry & Connection --------------------------
 struct OutEntry {
     BufferBlock *blk;
@@ -504,59 +556,65 @@ struct OutEntry {
 
 class Connection {
 public:
-    int fd;
-    RingBuffer *rx;
-    std::vector<OutEntry> out_ring;
-    size_t out_cap;
-    size_t out_head;
-    size_t out_tail;
-    uint64_t last_active_ms;
+    std::atomic<int> refcount{0};
+    Connection *next = nullptr;
+    int fd = -1;
+    RingBuffer *rx = nullptr;
+    BufferBlock *out_buffer = nullptr; // 替换 out_ring 为单一 BufferBlock
+    size_t out_offset = 0; // 当前写入偏移
+    size_t out_len = 0; // 当前有效数据长度
+    uint64_t last_active_ms = 0;
 
-    Connection(int fd_, RingBuffer *rb, size_t cap)
-        : fd(fd_), rx(rb), out_ring(cap), out_cap(cap), out_head(0), out_tail(0),
-          last_active_ms(now_ms()) {
+    Connection() {}
+
+    void reset(DualBufferPool &p, RingBufferPool &rp) {
+        if (fd >= 0) ::close(fd);
+        fd = -1;
+        if (rx) rp.release_ref(rx);
+        rx = nullptr;
+        if (out_buffer) {
+            p.release_ref(out_buffer);
+            out_buffer = nullptr;
+        }
+        out_offset = out_len = 0;
+        last_active_ms = 0;
     }
 
-    bool out_push(const OutEntry &e) {
-        size_t n = (out_tail + 1) % out_cap;
-        if (n == out_head)
-            return false;
-        out_ring[out_tail] = e;
-        out_tail = n;
+    bool out_push(const OutEntry &e, DualBufferPool &pool) {
+        if (!out_buffer) {
+            out_buffer = pool.acquire(LARGE_BLOCK);
+            if (!out_buffer)
+                return false;
+        }
+        if (out_offset + e.len > out_buffer->cap)
+            return false; // 缓冲区不足
+        memcpy(out_buffer->data + out_offset, e.blk->data + e.offset, e.len);
+        out_offset += e.len;
+        out_len += e.len;
+        pool.retain(out_buffer);
         return true;
     }
 
-    bool out_empty() const { return out_head == out_tail; }
-    // 填充 iovec，并返回被 peek 的条目下标（用于 advance）
-    size_t out_peek(iovec *iovs, size_t max, std::vector<size_t> &idxs) {
-        size_t cnt = 0, cur = out_head;
-        while (cur != out_tail && cnt < max) {
-            const OutEntry &e = out_ring[cur];
-            iovs[cnt] = iovec{e.blk->data + e.offset, e.len};
-            idxs.push_back(cur);
-            ++cnt;
-            cur = (cur + 1) % out_cap;
-        }
-        return cnt;
+    bool out_empty() const { return out_len == 0; }
+
+    iovec out_peek() {
+        if (out_empty() || !out_buffer)
+            return {nullptr, 0};
+        return {out_buffer->data, out_len};
     }
 
     void out_advance(size_t bytes_written, DualBufferPool &pool) {
-        size_t rem = bytes_written;
-        while (rem > 0 && out_head != out_tail) {
-            OutEntry &e = out_ring[out_head];
-            if (rem >= e.len) {
-                rem -= e.len;
-                BufferBlock *b = e.blk;
-                e.blk = nullptr;
-                e.offset = e.len = 0;
-                pool.release_ref(b);
-                out_head = (out_head + 1) % out_cap;
-            } else {
-                e.offset += rem;
-                e.len -= rem;
-                rem = 0;
-                break;
+        if (bytes_written >= out_len) {
+            out_len = 0;
+            out_offset = 0;
+            if (out_buffer) {
+                pool.release_ref(out_buffer);
+                out_buffer = nullptr;
             }
+        } else {
+            out_len -= bytes_written;
+            memmove(out_buffer->data, out_buffer->data + bytes_written, out_len);
+            out_offset = out_len;
         }
     }
 };
@@ -564,36 +622,78 @@ public:
 // -------------------------- ConnectionPool --------------------------
 class ConnectionPool {
 public:
-    ConnectionPool(size_t max_conn, DualBufferPool &pool)
-        : max_conn_(max_conn), pool_(pool) {
+    ConnectionPool(size_t max_conn, DualBufferPool &dp, RingBufferPool &rp)
+        : dp_(dp), rp_(rp), max_active_(max_conn) {
+        storage_.resize(max_conn);
+        for (size_t i = 0; i < max_conn; ++i) {
+            storage_[i] = std::make_unique<Connection>();
+            storage_[i]->next = (i + 1 < max_conn ? storage_[i + 1].get() : nullptr);
+        }
+        freelist_.store(storage_[0].get(), std::memory_order_release);
     }
 
-    bool admit(int fd, std::unique_ptr<Connection> &out_conn) {
-        for (;;) {
-            size_t cur = active_.load(std::memory_order_relaxed);
-            if (cur >= max_conn_)
-                return false;
-            if (active_.compare_exchange_strong(cur, cur + 1))
-                break;
+    bool admit(int fd, Connection **out_conn) {
+        if (active_.load(std::memory_order_relaxed) >= max_active_)
+            return false;
+
+        Connection *conn = acquire();
+        if (!conn)
+            return false;
+
+        RingBuffer *rb = rp_.acquire();
+        if (!rb) {
+            release_ref(conn);
+            return false;
         }
-        RingBuffer *rb = new RingBuffer(pool_);
-        out_conn.reset(new Connection(fd, rb, OUT_RING_CAP));
+
+        conn->fd = fd;
+        conn->rx = rb;
+        conn->last_active_ms = now_ms();
+        *out_conn = conn;
         return true;
     }
 
-    void release(std::unique_ptr<Connection> &conn) {
-        if (!conn)
-            return;
-        delete conn->rx;
-        conn->rx = nullptr;
-        ::close(conn->fd);
-        conn.reset();
-        active_.fetch_sub(1);
+    void release_ref(Connection *c) {
+        int prev = c->refcount.fetch_sub(1, std::memory_order_acq_rel);
+        if (prev == 1) {
+            c->reset(dp_, rp_);
+            Connection *head = freelist_.load(std::memory_order_relaxed);
+            do {
+                c->next = head;
+            } while (!freelist_.compare_exchange_weak(
+                head, c, std::memory_order_release, std::memory_order_relaxed));
+            active_.fetch_sub(1, std::memory_order_relaxed);
+        }
     }
 
 private:
-    size_t max_conn_;
-    DualBufferPool &pool_;
+    Connection *acquire() {
+        size_t cur = active_.load(std::memory_order_relaxed);
+        while (cur < max_active_) {
+            if (active_.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel))
+                break;
+        }
+        if (cur >= max_active_)
+            return nullptr;
+
+        Connection *h = freelist_.load(std::memory_order_acquire);
+        while (h) {
+            Connection *nxt = h->next;
+            if (freelist_.compare_exchange_weak(h, nxt, std::memory_order_acq_rel)) {
+                h->next = nullptr;
+                h->refcount.store(1, std::memory_order_relaxed);
+                return h;
+            }
+        }
+        active_.fetch_sub(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+
+    DualBufferPool &dp_;
+    RingBufferPool &rp_;
+    size_t max_active_;
+    std::vector<std::unique_ptr<Connection>> storage_;
+    std::atomic<Connection *> freelist_;
     std::atomic<size_t> active_{0};
 };
 
@@ -606,11 +706,11 @@ public:
     };
 
     explicit TimingWheel(uint64_t tick_ms, size_t slots)
-        : tick_ms_(tick_ms), slots_(normalize_pow2(slots)),
-          slot_mask_(slots_ - 1), initialized_(false), last_slot_index_(0) {
+        : tick_ms_(tick_ms), slots_(normalize_pow2(slots)), slot_mask_(slots_ - 1),
+          initialized_(false), last_slot_index_(0) {
         slots_q_.reserve(slots_);
         for (size_t i = 0; i < slots_; ++i)
-            slots_q_.emplace_back(std::make_unique<MPMCRing<Entry> >(1 << 14));
+            slots_q_.emplace_back(std::make_unique<MPMCRing<Entry>>(1 << 14));
     }
 
     inline void add(int fd, uint64_t expire_ms) {
@@ -680,7 +780,7 @@ private:
 
     const uint64_t tick_ms_;
     const size_t slots_, slot_mask_;
-    std::vector<std::unique_ptr<MPMCRing<Entry> > > slots_q_;
+    std::vector<std::unique_ptr<MPMCRing<Entry>>> slots_q_;
     std::atomic<bool> initialized_;
     std::atomic<size_t> last_slot_index_;
 };
@@ -693,8 +793,7 @@ struct ResponseTask {
 
 class TaskQueue {
 public:
-    TaskQueue() : q_(1 << 14) {
-    }
+    TaskQueue() : q_(1 << 14) {}
 
     bool enqueue(const ResponseTask &t) { return q_.enqueue(t); }
     bool dequeue(ResponseTask &o) { return q_.dequeue(o); }
@@ -723,7 +822,7 @@ public:
 
     ~WorkerPool() {
         stop_.store(true);
-        for (auto &t: threads_)
+        for (auto &t : threads_)
             t.join();
     }
 
@@ -759,8 +858,7 @@ public:
             uint64_t active_ms)
         : cpu_id_(cpu_id), listen_fd_(listen_fd), pool_(pool), cpool_(cpool),
           workers_(workers), idle_ms_(idle_ms), active_ms_(active_ms), taskq_(),
-          wheel_(100, 1024) {
-    }
+          wheel_(100, 1024) {}
 
     void run() {
         pin_cpu(cpu_id_);
@@ -797,7 +895,7 @@ public:
             ma.sin_family = AF_INET;
             ma.sin_port = htons(metrics_port_);
             ma.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            if (bind(mfd, (sockaddr *) &ma, sizeof ma) == 0 && listen(mfd, 64) == 0) {
+            if (bind(mfd, (sockaddr *)&ma, sizeof ma) == 0 && listen(mfd, 64) == 0) {
                 epoll_event mev{};
                 mev.events = EPOLLIN;
                 mev.data.fd = mfd;
@@ -811,13 +909,13 @@ public:
         }
 
         std::vector<epoll_event> evs(4096);
-        std::unordered_map<int, std::unique_ptr<Connection> > conns;
+        std::unordered_map<int, Connection *> conns;
 
         while (!global_stop_.load()) {
             // 先处理 worker 发回的响应，减少尾延迟
             process_incoming_tasks(conns);
 
-            int n = epoll_wait(epfd_, evs.data(), (int) evs.size(), 1000);
+            int n = epoll_wait(epfd_, evs.data(), (int)evs.size(), 1000);
             if (n < 0) {
                 if (errno == EINTR)
                     continue;
@@ -832,7 +930,7 @@ public:
                     accept_loop(conns);
                 } else if (fd == tfd) {
                     uint64_t exp;
-                    (void) read(tfd, &exp, sizeof(exp));
+                    (void)read(tfd, &exp, sizeof(exp));
                     wheel_.tick(tnow, [&](int xfd) { on_timeout(xfd, conns); });
                 } else if (fd == metrics_fd_) {
                     serve_metrics(fd);
@@ -840,9 +938,9 @@ public:
                     auto it = conns.find(fd);
                     if (it == conns.end())
                         continue;
-                    auto &conn = it->second;
+                    auto *conn = it->second;
                     if (events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) {
-                        close_conn(conn);
+                        close_conn(conn, conns);
                         continue;
                     }
                     if (events & EPOLLIN)
@@ -851,14 +949,14 @@ public:
                         on_writable(conn); // [ET-CRITICAL] write 循环到 EAGAIN 或队列空
                     if (tnow - conn->last_active_ms > idle_ms_) {
                         g_metrics.timeouts++;
-                        close_conn(conn);
+                        close_conn(conn, conns);
                     }
                 }
             }
         }
 
-        for (auto &p: conns)
-            cpool_.release(p.second);
+        for (auto &p : conns)
+            close_conn(p.second, conns);
         if (metrics_fd_ >= 0)
             close(metrics_fd_);
         close(epfd_);
@@ -892,13 +990,11 @@ private:
     }
 
     // [ET-CRITICAL] 批量 accept：循环最多 MAX_ACCEPT_BATCH 次，并在 EAGAIN 时退出
-    void
-    accept_loop(std::unordered_map<int, std::unique_ptr<Connection> > &conns) {
+    void accept_loop(std::unordered_map<int, Connection *> &conns) {
         for (int i = 0; i < MAX_ACCEPT_BATCH; ++i) {
             sockaddr_in in{};
             socklen_t inlen = sizeof(in);
-            int cfd = accept4(listen_fd_, (sockaddr *) &in, &inlen,
-                              SOCK_NONBLOCK | SOCK_CLOEXEC);
+            int cfd = accept4(listen_fd_, (sockaddr *)&in, &inlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
             if (cfd < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                     break;
@@ -908,8 +1004,8 @@ private:
                     break;
             }
             set_tcp_options(cfd);
-            std::unique_ptr<Connection> connptr;
-            if (!cpool_.admit(cfd, connptr)) {
+            Connection *conn = nullptr;
+            if (!cpool_.admit(cfd, &conn)) {
                 ::close(cfd);
                 continue;
             }
@@ -918,25 +1014,25 @@ private:
             ev.data.fd = cfd;
             if (epoll_ctl(epfd_, EPOLL_CTL_ADD, cfd, &ev) < 0) {
                 ::close(cfd);
-                cpool_.release(connptr);
+                cpool_.release_ref(conn);
                 continue;
             }
-            conns[cfd] = std::move(connptr);
+            conns[cfd] = conn;
             g_metrics.accepted++;
             wheel_.add(cfd, now_ms() + active_ms_);
         }
     }
 
     // [ET-CRITICAL] read 必须拉空直到 EAGAIN
-    void on_readable(std::unique_ptr<Connection> &conn) {
+    void on_readable(Connection *conn) {
         for (;;) {
             iovec w = conn->rx->writable_region(SMALL_BLOCK); // 先用小块读头
             if (w.iov_len == 0)
                 break;
             ssize_t n = ::read(conn->fd, w.iov_base, w.iov_len);
             if (n > 0) {
-                conn->rx->produce((size_t) n);
-                g_metrics.rx_bytes += (uint64_t) n;
+                conn->rx->produce((size_t)n);
+                g_metrics.rx_bytes += (uint64_t)n;
                 conn->last_active_ms = now_ms();
                 continue;
             }
@@ -988,7 +1084,7 @@ private:
             conn->rx->consume(H);
 
             // 读体阶段提示使用大块以提升吞吐
-            (void) conn->rx->writable_region(std::min<size_t>(
+            (void)conn->rx->writable_region(std::min<size_t>(
                 LARGE_BLOCK, std::max<size_t>(SMALL_BLOCK, hdr.body_len)));
 
             // steal body 拷贝到新块
@@ -1007,21 +1103,17 @@ private:
         }
     }
 
-    // [ET-CRITICAL] write 必须写到 EAGAIN 或队列空。若队列空则从 epoll 中移除
-    // EPOLLOUT 避免空转。
-    void on_writable(std::unique_ptr<Connection> &conn) {
+    // [ET-CRITICAL] write 必须写到 EAGAIN 或队列空
+    void on_writable(Connection *conn) {
         while (!conn->out_empty()) {
-            iovec iovs[OUT_RING_CAP];
-            std::vector<size_t> idxs;
-            idxs.reserve(OUT_RING_CAP);
-            size_t cnt = conn->out_peek(iovs, OUT_RING_CAP, idxs);
-            if (cnt == 0)
+            iovec iov = conn->out_peek();
+            if (iov.iov_len == 0)
                 break;
-            ssize_t n = writev(conn->fd, iovs, (int) cnt);
+            ssize_t n = ::write(conn->fd, iov.iov_base, iov.iov_len);
             if (n > 0) {
-                g_metrics.tx_bytes += (uint64_t) n;
+                g_metrics.tx_bytes += (uint64_t)n;
                 g_metrics.tx_pkts++;
-                conn->out_advance((size_t) n, pool_);
+                conn->out_advance((size_t)n, pool_);
                 continue;
             }
             if (n < 0) {
@@ -1039,31 +1131,29 @@ private:
         }
     }
 
-    void on_timeout(int fd,
-                    std::unordered_map<int, std::unique_ptr<Connection> > &conns) {
+    void on_timeout(int fd, std::unordered_map<int, Connection *> &conns) {
         auto it = conns.find(fd);
         if (it == conns.end())
             return;
         if (now_ms() - it->second->last_active_ms > idle_ms_) {
             g_metrics.timeouts++;
-            close_conn(it->second);
+            close_conn(it->second, conns);
         } else {
             wheel_.add(fd, now_ms() + active_ms_);
         }
     }
 
-    void process_incoming_tasks(
-        std::unordered_map<int, std::unique_ptr<Connection> > &conns) {
+    void process_incoming_tasks(std::unordered_map<int, Connection *> &conns) {
         ResponseTask t;
         while (taskq_.dequeue(t)) {
             auto it = conns.find(t.fd);
             if (it == conns.end()) {
-                pool_.release_ref(t.entry.blk); // 释放单一 entry 的 block
+                pool_.release_ref(t.entry.blk);
                 continue;
             }
-            auto &conn = it->second;
-            if (!conn->out_push(t.entry)) {
-                pool_.release_ref(t.entry.blk); // 释放失败时释放 block
+            Connection *conn = it->second;
+            if (!conn->out_push(t.entry, pool_)) {
+                pool_.release_ref(t.entry.blk);
                 g_metrics.drops++;
             } else {
                 epoll_event ev{};
@@ -1078,8 +1168,7 @@ private:
         for (;;) {
             sockaddr_in cli;
             socklen_t len = sizeof cli;
-            int c =
-                    accept4(mfd, (sockaddr *) &cli, &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+            int c = accept4(mfd, (sockaddr *)&cli, &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
             if (c < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                     break;
@@ -1087,7 +1176,7 @@ private:
                     break;
             }
             char buf[1024];
-            int n = (int) recv(c, buf, sizeof(buf) - 1, 0);
+            int n = (int)recv(c, buf, sizeof(buf) - 1, 0);
             if (n <= 0) {
                 close(c);
                 continue;
@@ -1096,30 +1185,30 @@ private:
             if (strncmp(buf, "GET /metrics", 12) == 0) {
                 std::string body = metrics_text();
                 char hdr[256];
-                int hn =
-                        snprintf(hdr, sizeof hdr,
-                                 "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nContent-Type: "
-                                 "text/plain; version=0.0.4\r\nConnection: close\r\n\r\n",
-                                 body.size());
+                int hn = snprintf(hdr, sizeof hdr,
+                                  "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nContent-Type: "
+                                  "text/plain; version=0.0.4\r\nConnection: close\r\n\r\n",
+                                  body.size());
                 send(c, hdr, hn, 0);
                 send(c, body.data(), body.size(), 0);
             } else {
-                const char *r =
-                        "HTTP/1.1 404\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                const char *r = "HTTP/1.1 404\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                 send(c, r, strlen(r), 0);
             }
             close(c);
         }
     }
 
-    void close_conn(std::unique_ptr<Connection> &conn) {
+    void close_conn(Connection *conn, std::unordered_map<int, Connection *> &conns) {
         if (!conn)
             return;
         g_metrics.closed++;
-        cpool_.release(conn);
+        epoll_ctl(epfd_, EPOLL_CTL_DEL, conn->fd, nullptr);
+        conns.erase(conn->fd);
+        cpool_.release_ref(conn);
     }
 
-    void throw_close(std::unique_ptr<Connection> &conn) { close_conn(conn); }
+    void throw_close(Connection *conn) { close_conn(conn, *(std::unordered_map<int, Connection *> *)nullptr); }
 };
 
 // -------------------------- 主程序 --------------------------
@@ -1137,13 +1226,13 @@ int main(int argc, char **argv) {
     uint16_t port = 9000;
     uint16_t metrics_port = 9100;
     if (argc > 1)
-        port = (uint16_t) atoi(argv[1]);
+        port = (uint16_t)atoi(argv[1]);
     if (argc > 2)
-        metrics_port = (uint16_t) atoi(argv[2]);
+        metrics_port = (uint16_t)atoi(argv[2]);
 
     int ncpu = get_nprocs();
-    size_t small_blocks = (size_t) ncpu * 64 * 1024; // 可按内存和连接数调节
-    size_t large_blocks = (size_t) ncpu * 32 * 1024;
+    size_t small_blocks = (size_t)ncpu * 64 * 1024; // 可按内存和连接数调节
+    size_t large_blocks = (size_t)ncpu * 32 * 1024;
 
     LOG_INFO("ET-opt server starting on port %u with %d CPUs, small_blocks=%zu, "
              "large_blocks=%zu",
@@ -1151,12 +1240,12 @@ int main(int argc, char **argv) {
 
     DualBufferPool pool(small_blocks, large_blocks);
     size_t max_conn = 1000000;
-    ConnectionPool cpool(max_conn, pool);
+    RingBufferPool rpool(max_conn, pool);
+    ConnectionPool cpool(max_conn, pool, rpool);
     size_t worker_threads = std::max(1, ncpu * 1);
     WorkerPool workers(worker_threads);
 
-    int listen_fd =
-            socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (listen_fd < 0)
         die("socket");
     set_tcp_options(listen_fd);
@@ -1164,17 +1253,17 @@ int main(int argc, char **argv) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(listen_fd, (sockaddr *) &addr, sizeof addr) < 0)
+    if (bind(listen_fd, (sockaddr *)&addr, sizeof addr) < 0)
         die("bind");
     if (listen(listen_fd, 65535) < 0)
         die("listen");
 
     // 启动 per-cpu Reactor（共享同一个 listen_fd）
     std::vector<std::thread> reactor_threads;
-    std::vector<std::unique_ptr<Reactor> > reactors;
+    std::vector<std::unique_ptr<Reactor>> reactors;
     for (int i = 0; i < ncpu; ++i) {
         reactors.emplace_back(new Reactor(i, listen_fd, pool, cpool, workers,
-                                          DEFAULT_IDLE_MS, DEFAULT_ACTIVE_MS));
+                                         DEFAULT_IDLE_MS, DEFAULT_ACTIVE_MS));
         reactors.back()->set_metrics_port(metrics_port);
         reactor_threads.emplace_back([&r = reactors.back()]() { r->run(); });
     }
@@ -1185,7 +1274,7 @@ int main(int argc, char **argv) {
         while (!g_terminate.load()) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             auto now = steady_clock::now();
-            double s = duration_cast<duration<double> >(now - last).count();
+            double s = duration_cast<duration<double>>(now - last).count();
             last = now;
             uint64_t rx = g_metrics.rx_bytes.load(), tx = g_metrics.tx_bytes.load();
             double rxrate = (rx - last_rx) / s, txrate = (tx - last_tx) / s;
@@ -1194,23 +1283,23 @@ int main(int argc, char **argv) {
             fprintf(stderr,
                     "[metrics] acc=%llu cls=%llu rx=%llu tx=%llu rx/s=%.0fB "
                     "tx/s=%.0fB pkts(rx=%llu tx=%llu) drop=%llu err=%llu to=%llu\n",
-                    (unsigned long long) g_metrics.accepted.load(),
-                    (unsigned long long) g_metrics.closed.load(),
-                    (unsigned long long) rx, (unsigned long long) tx, rxrate, txrate,
-                    (unsigned long long) g_metrics.rx_pkts.load(),
-                    (unsigned long long) g_metrics.tx_pkts.load(),
-                    (unsigned long long) g_metrics.drops.load(),
-                    (unsigned long long) g_metrics.parse_errors.load(),
-                    (unsigned long long) g_metrics.timeouts.load());
+                    (unsigned long long)g_metrics.accepted.load(),
+                    (unsigned long long)g_metrics.closed.load(),
+                    (unsigned long long)rx, (unsigned long long)tx, rxrate, txrate,
+                    (unsigned long long)g_metrics.rx_pkts.load(),
+                    (unsigned long long)g_metrics.tx_pkts.load(),
+                    (unsigned long long)g_metrics.drops.load(),
+                    (unsigned long long)g_metrics.parse_errors.load(),
+                    (unsigned long long)g_metrics.timeouts.load());
         }
     });
 
     while (!g_terminate.load())
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     LOG_INFO("shutdown requested, stopping reactors");
-    for (auto &r: reactors)
+    for (auto &r : reactors)
         r->stop();
-    for (auto &t: reactor_threads)
+    for (auto &t : reactor_threads)
         if (t.joinable())
             t.join();
     metrics_printer.join();
