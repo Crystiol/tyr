@@ -133,20 +133,21 @@ static inline uint32_t crc32_calc(const void *data, size_t len) {
 static inline uint32_t bswap32_u32(uint32_t v) { return __builtin_bswap32(v); }
 
 // -------------------------- BufferBlock & 双层 BufferPool --------------------------
-struct BufferBlock {
+struct alignas(64) BufferBlock {
     std::atomic<int> refcount;
     BufferBlock *next;
     size_t cap;
-    alignas(64) uint8_t *data;
+    uint8_t *data;
 };
 
 class BufferPoolBase {
 public:
     BufferPoolBase(size_t block_size, size_t total_blocks) : bs_(block_size) {
-        storage_.resize(total_blocks);
-        backing_.resize(total_blocks * block_size);
-        for (size_t i = 0; i < total_blocks; ++i)
+        storage_.reserve(total_blocks);
+        backing_.reserve(total_blocks * block_size);
+        for (size_t i = 0; i < total_blocks; ++i){
             storage_.emplace_back(std::make_unique<BufferBlock>());
+        }
 
         for (size_t i = 0; i < total_blocks; ++i) {
             storage_[i]->cap = bs_;
@@ -227,7 +228,7 @@ class MPMCRing {
 public:
     explicit MPMCRing(size_t cap_pow2) : size_(cap_pow2), mask_(cap_pow2 - 1) {
         assert((cap_pow2 & (cap_pow2 - 1)) == 0);
-        entries_.resize(size_);
+        entries_.reserve(size_);
         for (size_t i = 0; i < size_; ++i) {
             entries_.emplace_back(std::make_unique<Entry>(i));
         }
@@ -287,7 +288,7 @@ private:
 
     std::vector<std::unique_ptr<Entry>> entries_;
     size_t size_, mask_;
-    alignas(64) std::atomic<size_t> head_, tail_;
+    std::atomic<size_t> head_, tail_;
 };
 
 template<typename T>
@@ -1231,15 +1232,15 @@ int main(int argc, char **argv) {
         metrics_port = (uint16_t)atoi(argv[2]);
 
     int ncpu = get_nprocs();
-    size_t small_blocks = (size_t)ncpu * 64 * 1024; // 可按内存和连接数调节
-    size_t large_blocks = (size_t)ncpu * 32 * 1024;
+    size_t small_blocks = (size_t)ncpu * 128 * 1024; // 可按内存和连接数调节
+    size_t large_blocks = (size_t)ncpu * 16 * 1024;
 
     LOG_INFO("ET-opt server starting on port %u with %d CPUs, small_blocks=%zu, "
              "large_blocks=%zu",
              port, ncpu, small_blocks, large_blocks);
 
     DualBufferPool pool(small_blocks, large_blocks);
-    size_t max_conn = 1000000;
+    size_t max_conn = 100000;
     RingBufferPool rpool(max_conn, pool);
     ConnectionPool cpool(max_conn, pool, rpool);
     size_t worker_threads = std::max(1, ncpu * 1);
