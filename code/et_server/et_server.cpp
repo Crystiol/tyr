@@ -891,7 +891,7 @@ public:
         epoll_ctl(epfd_, EPOLL_CTL_ADD, tfd, &tev);
 
         // metrics socket（loopback）
-        int mfd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        /*int mfd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (mfd >= 0) {
             int yes = 1;
             setsockopt(mfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
@@ -910,7 +910,7 @@ public:
             } else {
                 close(mfd);
             }
-        }
+        }*/
 
         std::vector<epoll_event> evs(4096);
         std::unordered_map<int, Connection *> conns;
@@ -1023,6 +1023,7 @@ private:
                 continue;
             }
             conns[cfd] = conn;
+            //g_metrics.accepted++;
             g_metrics.accepted.fetch_add(1, std::memory_order_relaxed);
             wheel_.add(cfd, now_ms() + active_ms_);
         }
@@ -1236,15 +1237,15 @@ int main(int argc, char **argv) {
         metrics_port = (uint16_t)atoi(argv[2]);
 
     int ncpu = get_nprocs();
-    size_t small_blocks = (size_t)ncpu * 1 * 1024; // 可按内存和连接数调节
-    size_t large_blocks = (size_t)ncpu * 1 * 1024;
+    size_t small_blocks = (size_t)ncpu * 1024 * 1024; // 可按内存和连接数调节
+    size_t large_blocks = (size_t)ncpu * 32 * 1024;
 
     LOG_INFO("ET-opt server starting on port %u with %d CPUs, small_blocks=%zu, "
              "large_blocks=%zu",
              port, ncpu, small_blocks, large_blocks);
 
     DualBufferPool pool(small_blocks, large_blocks);
-    size_t max_conn = 1000;
+    size_t max_conn = 100000;
     RingBufferPool rpool(max_conn, pool);
     ConnectionPool cpool(max_conn, pool, rpool);
     size_t worker_threads = std::max(1, ncpu * 1);
