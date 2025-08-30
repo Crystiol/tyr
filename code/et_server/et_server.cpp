@@ -39,6 +39,8 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
+#include <sys/time.h>
+#include <time.h>
 
 using namespace std::chrono;
 
@@ -83,7 +85,7 @@ static const uint64_t DEFAULT_ACTIVE_MS = 5 * 60 * 1000;
 // -------------------------- Metrics --------------------------
 struct Metrics {
     std::atomic<uint64_t> accepted{0}, closed{0}, rx_bytes{0}, tx_bytes{0},
-            rx_pkts{0}, tx_pkts{0}, drops{0}, parse_errors{0}, timeouts{0};
+        rx_pkts{0}, tx_pkts{0}, drops{0}, parse_errors{0}, timeouts{0}, s_pool{0}, l_pool{0}, r_pool{0}, c_pool{0};
 } g_metrics;
 
 static std::string metrics_text() {
@@ -97,7 +99,11 @@ static std::string metrics_text() {
                      "server_tx_pkts %llu\n"
                      "server_drops %llu\n"
                      "server_parse_errors %llu\n"
-                     "server_timeouts %llu\n",
+                     "server_timeouts %llu\n"
+                     "small_pool %llu\n"
+                     "large_pool %llu\n"
+                     "ring_pool %llu\n"
+                     "conn_pool %llu\n",
                      (unsigned long long)g_metrics.accepted.load(),
                      (unsigned long long)g_metrics.closed.load(),
                      (unsigned long long)g_metrics.rx_bytes.load(),
@@ -106,7 +112,11 @@ static std::string metrics_text() {
                      (unsigned long long)g_metrics.tx_pkts.load(),
                      (unsigned long long)g_metrics.drops.load(),
                      (unsigned long long)g_metrics.parse_errors.load(),
-                     (unsigned long long)g_metrics.timeouts.load());
+                     (unsigned long long)g_metrics.timeouts.load(),
+                     (unsigned long long)g_metrics.s_pool.load(),
+                     (unsigned long long)g_metrics.l_pool.load(),
+                     (unsigned long long)g_metrics.r_pool.load(),
+                     (unsigned long long)g_metrics.c_pool.load());
     return std::string(buf, n);
 }
 
@@ -199,13 +209,18 @@ class DualBufferPool {
 public:
     DualBufferPool(size_t small_blocks, size_t large_blocks)
         : small_(SMALL_BLOCK, small_blocks), large_(LARGE_BLOCK, large_blocks) {
+        g_metrics.s_pool.store(small_blocks);
+        g_metrics.l_pool.store(large_blocks);
     }
 
     BufferBlock *acquire(size_t expect) {
         if (expect <= small_.block_size()) {
-            if (auto b = small_.acquire())
+            if (auto b = small_.acquire()){
+                g_metrics.s_pool.fetch_sub(1, std::memory_order_relaxed);
                 return b;
+            }
         }
+        g_metrics.l_pool.fetch_sub(1, std::memory_order_relaxed);
         return large_.acquire();
     }
 
@@ -215,6 +230,7 @@ public:
 
     void release_ref(BufferBlock *b) {
         (b->cap == SMALL_BLOCK ? small_ : large_).release_ref(b);
+        b->cap == SMALL_BLOCK ? g_metrics.s_pool.fetch_add(1, std::memory_order_relaxed) : g_metrics.l_pool.fetch_add(1, std::memory_order_relaxed);
     }
 
 private:
@@ -517,6 +533,7 @@ public:
             storage_[i]->next = (i + 1 < total ? storage_[i + 1].get() : nullptr);
         }
         freelist_.store(storage_[0].get(), std::memory_order_release);
+        g_metrics.r_pool.store(total);
     }
 
     RingBuffer *acquire() {
@@ -526,6 +543,7 @@ public:
             if (freelist_.compare_exchange_weak(h, nxt, std::memory_order_acq_rel)) {
                 h->next = nullptr;
                 h->refcount.store(1, std::memory_order_relaxed);
+                g_metrics.r_pool.fetch_sub(1, std::memory_order_relaxed);
                 return h;
             }
         }
@@ -541,6 +559,7 @@ public:
                 b->next = head;
             } while (!freelist_.compare_exchange_weak(
                 head, b, std::memory_order_release, std::memory_order_relaxed));
+            g_metrics.r_pool.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -633,6 +652,7 @@ public:
             storage_[i]->next = (i + 1 < max_conn ? storage_[i + 1].get() : nullptr);
         }
         freelist_.store(storage_[0].get(), std::memory_order_release);
+        g_metrics.c_pool.store(max_conn);
     }
 
     bool admit(int fd, Connection **out_conn) {
@@ -666,6 +686,7 @@ public:
             } while (!freelist_.compare_exchange_weak(
                 head, c, std::memory_order_release, std::memory_order_relaxed));
             active_.fetch_sub(1, std::memory_order_relaxed);
+            g_metrics.c_pool.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -685,6 +706,7 @@ private:
             if (freelist_.compare_exchange_weak(h, nxt, std::memory_order_acq_rel)) {
                 h->next = nullptr;
                 h->refcount.store(1, std::memory_order_relaxed);
+                g_metrics.c_pool.fetch_sub(1, std::memory_order_relaxed);
                 return h;
             }
         }
@@ -809,8 +831,9 @@ static inline void
 business_worker_echo(int fd, BufferBlock *stolen_block, size_t body_len, TaskQueue &reactor_queue) {
     ResponseTask t;
     t.fd = fd;
-    memcpy(stolen_block->data, "aaaaaa", 6);
-    t.entry = {stolen_block, 0, 6};
+    //memcpy(stolen_block->data, "aaaaaa", 6);
+    //t.entry = {stolen_block, 0, 6};
+    t.entry = {stolen_block, 0, body_len};
     while (!reactor_queue.enqueue(t))
         std::this_thread::yield();
 }
@@ -1237,8 +1260,8 @@ int main(int argc, char **argv) {
         metrics_port = (uint16_t)atoi(argv[2]);
 
     int ncpu = get_nprocs();
-    size_t small_blocks = (size_t)ncpu * 1024 * 1024; // 可按内存和连接数调节
-    size_t large_blocks = (size_t)ncpu * 32 * 1024;
+    size_t small_blocks = (size_t)ncpu * 1000 * 1000; // 可按内存和连接数调节
+    size_t large_blocks = (size_t)ncpu * 32 * 1000;
 
     LOG_INFO("ET-opt server starting on port %u with %d CPUs, small_blocks=%zu, "
              "large_blocks=%zu",
@@ -1261,7 +1284,7 @@ int main(int argc, char **argv) {
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(listen_fd, (sockaddr *)&addr, sizeof addr) < 0)
         die("bind");
-    if (listen(listen_fd, 65535) < 0)
+    if (listen(listen_fd, 1024) < 0)
         die("listen");
 
     // 启动 per-cpu Reactor（共享同一个 listen_fd）
@@ -1286,9 +1309,17 @@ int main(int argc, char **argv) {
             double rxrate = (rx - last_rx) / s, txrate = (tx - last_tx) / s;
             last_rx = rx;
             last_tx = tx;
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+
+            // 转换为本地时间
+            struct tm tm_info;
+            localtime_r(&tv.tv_sec, &tm_info);
+
             fprintf(stderr,
-                    "[metrics] acc=%llu cls=%llu rx=%llu tx=%llu rx/s=%.0fB "
-                    "tx/s=%.0fB pkts(rx=%llu tx=%llu) drop=%llu err=%llu to=%llu\n",
+                    "[metrics %04d-%02d-%02d %02d:%02d:%02d.%03ld] acc=%llu cls=%llu rx=%llu tx=%llu rx/s=%.0fB "
+                    "tx/s=%.0fB pkts(rx=%llu tx=%llu) drop=%llu err=%llu to=%llu sp=%llu lp=%llu rp=%llu cp=%llu\n",
+                    tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday, tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, tv.tv_usec / 1000,
                     (unsigned long long)g_metrics.accepted.load(),
                     (unsigned long long)g_metrics.closed.load(),
                     (unsigned long long)rx, (unsigned long long)tx, rxrate, txrate,
@@ -1296,7 +1327,11 @@ int main(int argc, char **argv) {
                     (unsigned long long)g_metrics.tx_pkts.load(),
                     (unsigned long long)g_metrics.drops.load(),
                     (unsigned long long)g_metrics.parse_errors.load(),
-                    (unsigned long long)g_metrics.timeouts.load());
+                    (unsigned long long)g_metrics.timeouts.load(),
+                    (unsigned long long)g_metrics.s_pool.load(),
+                    (unsigned long long)g_metrics.l_pool.load(),
+                    (unsigned long long)g_metrics.r_pool.load(),
+                    (unsigned long long)g_metrics.c_pool.load());
         }
     });
 
