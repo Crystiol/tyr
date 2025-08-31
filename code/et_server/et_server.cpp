@@ -185,7 +185,7 @@ public:
         b->refcount.fetch_add(1, std::memory_order_acq_rel);
     }
 
-    void release_ref(BufferBlock *b) {
+    bool release_ref(BufferBlock *b) {
         int prev = b->refcount.fetch_sub(1, std::memory_order_acq_rel);
         if (prev == 1) {
             BufferBlock *head = freelist_.load(std::memory_order_relaxed);
@@ -193,7 +193,9 @@ public:
                 b->next = head;
             } while (!freelist_.compare_exchange_weak(
                 head, b, std::memory_order_release, std::memory_order_relaxed));
+            return true;
         }
+        return false;
     }
 
     size_t block_size() const { return bs_; }
@@ -229,8 +231,9 @@ public:
     }
 
     void release_ref(BufferBlock *b) {
-        (b->cap == SMALL_BLOCK ? small_ : large_).release_ref(b);
-        b->cap == SMALL_BLOCK ? g_metrics.s_pool.fetch_add(1, std::memory_order_relaxed) : g_metrics.l_pool.fetch_add(1, std::memory_order_relaxed);
+        bool bRet = (b->cap == SMALL_BLOCK ? small_ : large_).release_ref(b);
+        if (bRet)
+            b->cap == SMALL_BLOCK ? g_metrics.s_pool.fetch_add(1, std::memory_order_relaxed) : g_metrics.l_pool.fetch_add(1, std::memory_order_relaxed);
     }
 
 private:
@@ -362,13 +365,13 @@ public:
         append_block(SMALL_BLOCK);
     }
 
-    // 获取可写区域（hint 参数决定分配小/大块）
+    // 获取可写区域（hint 参数决定分配小/大块）,写满一个块后才会写下一个扩展块
     iovec writable_region(size_t hint = SMALL_BLOCK) {
         ensure_tail(hint);
         return iovec{tail_->data + tail_off_, tail_->cap - tail_off_ - 1};
     }
 
-    // 标记已写入 n 字节
+    // 标记已写入 n 字节，根据需要扩展块
     void produce(size_t n) {
         tail_off_ += n;
         if (tail_off_ >= tail_->cap - 1) {
@@ -413,9 +416,9 @@ public:
             }
             remain -= avail;
             BufferBlock *old = head_;
-            head_ = old->next;
-            pool_.release_ref(old);
-            head_off_ = 0;
+            head_ = old->next;          //head指向下一块
+            pool_.release_ref(old);     //回收已读完的块
+            head_off_ = 0;              //下一块的起始地址必定为0，因为还没有被cosume
             if (!head_) {
                 tail_ = nullptr;
                 tail_off_ = 0;
@@ -424,15 +427,16 @@ public:
         }
     }
 
+    // 获取可读数据大小
     size_t readable_bytes() const {
         if (!head_)
             return 0;
-        if (head_ == tail_)
+        if (head_ == tail_) //只有一个块
             return (tail_off_ >= head_off_) ? (tail_off_ - head_off_) : 0;
         size_t cnt = 0;
         BufferBlock *cur = head_;
         size_t off = head_off_;
-        while (cur) {
+        while (cur) {       //多个块的情形，剩余空间+新块已用
             if (cur == tail_) {
                 cnt += tail_off_ - off;
                 break;
@@ -510,14 +514,14 @@ private:
             head_ = tail_ = b;
             head_off_ = tail_off_ = 0;
         } else {
-            tail_->next = b;
+            tail_->next = b;        //将新块链接在当前块后边
             tail_ = b;
         }
     }
 
     void ensure_tail(size_t hint) {
         if (!tail_ || tail_off_ >= tail_->cap - 1) {
-            append_block(hint);
+            append_block(hint);     //未分配块或块已满则分配新块
             tail_off_ = 0;
         }
     }
@@ -604,7 +608,7 @@ public:
 
     bool out_push(const OutEntry &e, DualBufferPool &pool) {
         if (!out_buffer) {
-            out_buffer = pool.acquire(LARGE_BLOCK);
+            out_buffer = pool.acquire(LARGE_BLOCK);     //分配发送缓冲区
             if (!out_buffer)
                 return false;
         }
@@ -613,7 +617,7 @@ public:
         memcpy(out_buffer->data + out_offset, e.blk->data + e.offset, e.len);
         out_offset += e.len;
         out_len += e.len;
-        pool.retain(out_buffer);
+        pool.retain(out_buffer);    //add发送缓冲区计数，可以避免再次分配
         return true;
     }
 
@@ -630,8 +634,8 @@ public:
             out_len = 0;
             out_offset = 0;
             if (out_buffer) {
-                pool.release_ref(out_buffer);
-                out_buffer = nullptr;
+                pool.release_ref(out_buffer);            //回收发送缓冲区
+                //out_buffer = nullptr;       //如果out_push中调用了pool.retain(out_buffer)，则不应该赋空
             }
         } else {
             out_len -= bytes_written;
@@ -670,7 +674,7 @@ public:
         }
 
         conn->fd = fd;
-        conn->rx = rb;
+        conn->rx = rb;      //为连接分配接收缓冲区rx
         conn->last_active_ms.store(now_ms(), std::memory_order_relaxed);
         *out_conn = conn;
         return true;
@@ -1065,7 +1069,7 @@ private:
                 conn->last_active_ms.store(now_ms(), std::memory_order_relaxed);
                 continue;
             }
-            if (n == 0) {
+            if (n == 0) {   //客户端关闭了连接
                 close_conn(conn, conns);
                 return;
             }
@@ -1081,10 +1085,10 @@ private:
 
         const size_t H = 1 + 4 + 1 + 4; // magic + body_len + endian + hdr_crc
         while (true) {
-            if (conn->rx->readable_bytes() < H)
+            if (conn->rx->readable_bytes() < H)     //检查可读字节是否少于包头长度
                 break;
             uint8_t hdrbuf[10];
-            size_t got = conn->rx->peek_bytes(hdrbuf, H);
+            size_t got = conn->rx->peek_bytes(hdrbuf, H);   //获取包头长度字节数据
             if (got < H)
                 break;
             PacketHeader hdr;
@@ -1094,7 +1098,7 @@ private:
             hdr.endian = hdrbuf[5];
             memcpy(&hdr.hdr_crc, hdrbuf + 6, 4);
             uint32_t crc = crc32_calc(hdrbuf, 6);
-            if (hdr.magic != 0x7e || hdr.hdr_crc != crc) {
+            if (hdr.magic != 0x7e || hdr.hdr_crc != crc) {  //校验包头
                 g_metrics.parse_errors++;
                 close_conn(conn, conns);
                 return;
@@ -1106,13 +1110,13 @@ private:
                 close_conn(conn, conns);
                 return;
             }
-            if (conn->rx->readable_bytes() < H + hdr.body_len)
+            if (conn->rx->readable_bytes() < H + hdr.body_len)  //检查是否是个完整包
                 break;
 
             // consume header
             conn->rx->consume(H);
 
-            // 读体阶段提示使用大块以提升吞吐
+            // 读包体阶段提示使用大块以提升吞吐，并不一定能实现使用大块读
             (void)conn->rx->writable_region(std::min<size_t>(
                 LARGE_BLOCK, std::max<size_t>(SMALL_BLOCK, hdr.body_len)));
 
@@ -1182,7 +1186,7 @@ private:
             }
             Connection *conn = it->second;
             if (!conn->out_push(t.entry, pool_)) {
-                pool_.release_ref(t.entry.blk);
+                //pool_.release_ref(t.entry.blk);       //释放on_readable中分配的block
                 g_metrics.drops++;
             } else {
                 epoll_event ev{};
@@ -1190,6 +1194,7 @@ private:
                 ev.data.fd = conn->fd;
                 epoll_ctl(epfd_, EPOLL_CTL_MOD, conn->fd, &ev);
             }
+            pool_.release_ref(t.entry.blk);
         }
     }
 
@@ -1232,6 +1237,12 @@ private:
         if (!conn)
             return;
         g_metrics.closed++;
+
+        if (conn->out_buffer) {
+            pool_.release_ref(conn->out_buffer);
+            conn->out_buffer = nullptr;
+        }
+
         epoll_ctl(epfd_, EPOLL_CTL_DEL, conn->fd, nullptr);
         conns.erase(conn->fd);
         cpool_.release_ref(conn);
