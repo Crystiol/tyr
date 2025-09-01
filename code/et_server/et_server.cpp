@@ -772,7 +772,7 @@ public:
     }
 
 private:
-    template<typename F>
+    /*template<typename F>
     void drain(size_t idx, uint64_t now_ms, F &on_timeout) {
         Entry e;
         while (slots_q_[idx]->dequeue(e)) {
@@ -780,6 +780,24 @@ private:
                 on_timeout(e.fd);
             else
                 add(e.fd, e.expire_ms);
+        }
+    }*/
+	
+	template<typename F>
+    void drain(size_t idx, uint64_t now_ms, F &on_timeout) {
+        Entry e;
+        while (slots_q_[idx]->dequeue(e)) {
+            if (e.expire_ms <= now_ms) {
+                on_timeout(e.fd);
+            } else {
+                // 如果条目计算出来的槽正好是当前正在 drain 的槽，
+                // 那么把 expire_ms 向后推进一个 tick，避免被立即再次处理。
+                size_t target_idx = slot_index(e.expire_ms);
+                if (target_idx == idx) {
+                    e.expire_ms += tick_ms_;
+                }
+                add(e.fd, e.expire_ms);
+            }
         }
     }
 
