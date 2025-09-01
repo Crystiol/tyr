@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 2.8.3)
+
+project(examples)
+
+include_directories(../cpputil ../evpp)
+include_directories(.. ../base ../ssl ../event ../util)
+
+add_executable(TcpClient_test TcpClient_test.cpp)
+target_link_libraries(TcpClient_test PRIVATE ${CMAKE_SOURCE_DIR}/../lib/libhv.a pthread)
+
+add_executable(TcpServer_test TcpServer_test.cpp)
+target_link_libraries(TcpServer_test PRIVATE ${CMAKE_SOURCE_DIR}/../lib/libhv.a pthread)
+
