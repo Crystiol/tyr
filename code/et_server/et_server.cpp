@@ -1313,7 +1313,7 @@ int main(int argc, char **argv) {
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(listen_fd, (sockaddr *)&addr, sizeof addr) < 0)
         die("bind");
-    if (listen(listen_fd, 1024) < 0)
+    if (listen(listen_fd, 65535) < 0)
         die("listen");
 
     // 启动 per-cpu Reactor（共享同一个 listen_fd）
