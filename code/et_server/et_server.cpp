@@ -326,6 +326,7 @@ template<typename T>
 using WorkQueue = WorkQueueWrapper<T>;
 
 // -------------------------- 协议头（示例） --------------------------
+#ifndef TEST
 #pragma pack(push, 1)
 struct PacketHeader {
     uint8_t magic;
@@ -334,7 +335,14 @@ struct PacketHeader {
     uint32_t hdr_crc;
 };
 #pragma pack(pop)
-
+#else
+#pragma pack(push, 1)
+struct PacketHeader {
+    uint8_t body_offset;
+    uint32_t body_len;
+};
+#pragma pack(pop)
+#endif
 // -------------------------- RingBuffer（零拷贝入站，支持双层块） --------------------------
 class RingBuffer {
 public:
@@ -1100,11 +1108,15 @@ private:
                 return;
             }
         }
-
+#ifndef TEST
         const size_t H = 1 + 4 + 1 + 4; // magic + body_len + endian + hdr_crc
+#else
+		const size_t H = 1 + 4; // body_offset + body_len
+#endif
         while (true) {
             if (conn->rx->readable_bytes() < H)     //检查可读字节是否少于包头长度
                 break;
+#ifndef TEST
             uint8_t hdrbuf[10];
             size_t got = conn->rx->peek_bytes(hdrbuf, H);   //获取包头长度字节数据
             if (got < H)
@@ -1122,6 +1134,17 @@ private:
                 return;
             }
             hdr.body_len = hdr.endian ? bswap32_u32(bl) : bl;
+#else
+			uint8_t hdrbuf[5];
+            size_t got = conn->rx->peek_bytes(hdrbuf, H);   //获取包头长度字节数据
+            if (got < H)
+                break;
+            PacketHeader hdr;
+            hdr.body_offset = hdrbuf[0];
+            uint32_t bl;
+            memcpy(&bl, hdrbuf + 1, 4);
+            hdr.body_len = bl;
+#endif
             const uint32_t MAX_BODY = 16 * 1024 * 1024;
             if (hdr.body_len > MAX_BODY) {
                 g_metrics.parse_errors++;
