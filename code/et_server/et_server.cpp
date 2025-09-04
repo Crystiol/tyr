@@ -596,7 +596,9 @@ public:
         storage_.resize(total);
         for (size_t i = 0; i < total; ++i) {
             storage_[i] = std::make_unique<RingBuffer>(dp_);
-            storage_[i]->next = (i + 1 < total ? storage_[i + 1].get() : nullptr);
+        }
+        for (size_t i = 0; i + 1 < total; ++i) {
+            storage_[i]->next = storage_[i + 1].get();
         }
         freelist_.store(storage_[0].get(), std::memory_order_release);
         g_metrics.r_pool.store(total);
@@ -715,22 +717,29 @@ public:
         storage_.resize(max_conn);
         for (size_t i = 0; i < max_conn; ++i) {
             storage_[i] = std::make_unique<Connection>();
-            storage_[i]->next = (i + 1 < max_conn ? storage_[i + 1].get() : nullptr);
+        }
+        for (size_t i = 0; i + 1 < max_conn; ++i) {
+            storage_[i]->next = storage_[i + 1].get();
         }
         freelist_.store(storage_[0].get(), std::memory_order_release);
         g_metrics.c_pool.store(max_conn);
     }
 
     bool admit(int fd, Connection **out_conn) {
-        if (active_.load(std::memory_order_relaxed) >= max_active_)
+        if (active_.load(std::memory_order_relaxed) >= max_active_){
+            logger_->debug("admit 1");
             return false;
+        }
 
         Connection *conn = acquire();
-        if (!conn)
+        if (!conn){
+            logger_->debug("admit 2");
             return false;
+        }
 
         RingBuffer *rb = rp_.acquire();
         if (!rb) {
+            logger_->debug("admit 3");
             release_ref(conn);
             return false;
         }
@@ -763,8 +772,10 @@ private:
             if (active_.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel))
                 break;
         }
-        if (cur >= max_active_)
+        if (cur >= max_active_){
+            logger_->debug("acquire 1");
             return nullptr;
+        }
 
         Connection *h = freelist_.load(std::memory_order_acquire);
         while (h) {
@@ -777,6 +788,7 @@ private:
             }
         }
         active_.fetch_sub(1, std::memory_order_relaxed);
+        logger_->debug("acquire 2: {} {}", active_.load(), g_metrics.c_pool.load());
         return nullptr;
     }
 
@@ -1086,7 +1098,7 @@ public:
                     }
                     uint64_t last = conn->last_active_ms.load(std::memory_order_relaxed);
                     if (tnow >= last && tnow - last > idle_ms_) {
-                        g_metrics.timeouts++;
+                        g_metrics.timeouts.fetch_add(1, std::memory_order_relaxed);
                         close_conn(conn, conns);
                         logger_->debug("unexpect 1");
                     }
@@ -1153,7 +1165,9 @@ private:
             set_tcp_options(cfd);
             Connection *conn = nullptr;
             if (!cpool_.admit(cfd, &conn)) {
+                g_metrics.closed.fetch_add(1, std::memory_order_relaxed);
                 ::close(cfd);
+                logger_->debug("unexpect 7");
                 continue;
             }
             epoll_event ev{};
@@ -1168,9 +1182,8 @@ private:
                 continue;
             }
             conns[cfd] = conn;
-            //g_metrics.accepted++;
             g_metrics.accepted.fetch_add(1, std::memory_order_relaxed);
-            //wheel_.add(cfd, now_ms() + active_ms_);
+            wheel_.add(cfd, now_ms() + active_ms_);
         }
     }
 
@@ -1219,7 +1232,7 @@ private:
             hdr.body_len = bl;
             const uint32_t MAX_BODY = 16 * 1024 * 1024;
             if (hdr.body_len > MAX_BODY) {
-                g_metrics.parse_errors++;
+                g_metrics.parse_errors.fetch_add(1, std::memory_order_relaxed);
                 logger_->debug("unexpect 4");
                 close_conn(conn, conns);
                 return;
@@ -1237,10 +1250,10 @@ private:
             // steal body 拷贝到新块
             BufferBlock *stolen = conn->rx->steal_body_after(0, hdr.body_len);
             if (!stolen) {
-                g_metrics.drops++;
+                g_metrics.drops.fetch_add(1, std::memory_order_relaxed);
                 break;
             }
-            g_metrics.rx_pkts++;
+            g_metrics.rx_pkts.fetch_add(1, std::memory_order_relaxed);
 
             // 把工作投递给 worker: long time work
             /*auto job = [fd = conn->fd, stolen, body_len = hdr.body_len, this]() {
@@ -1301,7 +1314,7 @@ private:
         if (it == conns.end())
             return;
         if (now_ms() - it->second->last_active_ms > idle_ms_) {
-            g_metrics.timeouts++;
+            g_metrics.timeouts.fetch_add(1, std::memory_order_relaxed);
             close_conn(it->second, conns);
             logger_->debug("unexpect 6");
         } else {
@@ -1323,7 +1336,7 @@ private:
             }
             Connection *conn = it->second;
             if (!conn->out_push(t.entry, pool_)) {
-                g_metrics.drops++;
+                g_metrics.drops.fetch_add(1, std::memory_order_relaxed);
                 pool_.release_ref(t.entry.blk);
                 logger_->debug("unexpected 2");
                 continue;
@@ -1377,7 +1390,7 @@ private:
     void close_conn(Connection *conn, std::unordered_map<int, Connection *> &conns) {
         if (!conn)
             return;
-        g_metrics.closed++;
+        g_metrics.closed.fetch_add(1, std::memory_order_relaxed);
 
         if (conn->out_buffer) {
             pool_.release_ref(conn->out_buffer);
@@ -1461,7 +1474,7 @@ int main(int argc, char **argv) {
         uint64_t last_rx = 0, last_tx = 0;
         auto last = steady_clock::now();
         while (!g_terminate.load()) {
-            std::this_thread::sleep_for(std::chrono::seconds(15));
+            std::this_thread::sleep_for(std::chrono::seconds(4));
             auto now = steady_clock::now();
             double s = duration_cast<duration<double>>(now - last).count();
             last = now;
