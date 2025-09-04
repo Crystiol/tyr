@@ -715,12 +715,11 @@ public:
     ConnectionPool(size_t max_conn, DualBufferPool &dp, RingBufferPool &rp)
         : dp_(dp), rp_(rp), max_active_(max_conn) {
         storage_.resize(max_conn);
-        for (size_t i = 0; i < max_conn; ++i) {
-            storage_[i] = std::make_unique<Connection>();
-        }
-        for (size_t i = 0; i + 1 < max_conn; ++i) {
-            storage_[i]->next = storage_[i + 1].get();
-        }
+        for (size_t i = max_conn; i-- > 0; ) {
+			storage_[i] = std::make_unique<Connection>();
+			storage_[i]->next = head;
+			head = storage_[i].get();
+		}
         freelist_.store(storage_[0].get(), std::memory_order_release);
         g_metrics.c_pool.store(max_conn);
     }
