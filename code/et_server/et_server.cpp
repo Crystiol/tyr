@@ -130,13 +130,18 @@ private:
     std::string func_;
 };
 
+/*
+ * active_ms < idle_ms → 检查更频繁，超时触发更接近真实 idle_ms。
+ * active_ms > idle_ms → 检查周期太长，会延迟发现超时，延迟时间最多等于 active_ms。
+*/
+
 // -------------------------- Config --------------------------
 static const size_t SMALL_BLOCK = 512; // 小块：协议头或小包
 static const size_t LARGE_BLOCK = 4096; // 大块：主体或大包
 static const int MAX_ACCEPT_BATCH = 64; // 每次 accept 最多尝试次数
 static const size_t OUT_BUFFER_CAP = LARGE_BLOCK; // 出站缓冲区容量（单一 BufferBlock）
-static const uint64_t DEFAULT_IDLE_MS = 60 * 1000;
-static const uint64_t DEFAULT_ACTIVE_MS = 5 * 60 * 1000;
+static const uint64_t DEFAULT_IDLE_MS = 30 * 1000;
+static const uint64_t DEFAULT_ACTIVE_MS = 1 * 60 * 1000;
 
 // -------------------------- Metrics --------------------------
 struct Metrics {
@@ -690,7 +695,8 @@ public:
     iovec out_peek() {
         if (out_empty() || !out_buffer)
             return {nullptr, 0};
-        return {out_buffer->data, out_len};
+        //return {out_buffer->data, out_len};
+        return {out_buffer->data, 8};			//测试收发，实际上客户端可能一次性读取返回数据，如果采用了类似et的方式
     }
 
     void out_advance(size_t bytes_written, DualBufferPool &pool) {
@@ -715,11 +721,12 @@ public:
     ConnectionPool(size_t max_conn, DualBufferPool &dp, RingBufferPool &rp)
         : dp_(dp), rp_(rp), max_active_(max_conn) {
         storage_.resize(max_conn);
-        for (size_t i = max_conn; i-- > 0; ) {
-			storage_[i] = std::make_unique<Connection>();
-			storage_[i]->next = head;
-			head = storage_[i].get();
-		}
+        for (size_t i = 0; i < max_conn; ++i) {
+            storage_[i] = std::make_unique<Connection>();
+        }
+        for (size_t i = 0; i + 1 < max_conn; ++i) {
+            storage_[i]->next = storage_[i + 1].get();
+        }
         freelist_.store(storage_[0].get(), std::memory_order_release);
         g_metrics.c_pool.store(max_conn);
     }
@@ -811,11 +818,17 @@ public:
         : tick_ms_(tick_ms), slots_(normalize_pow2(slots)), slot_mask_(slots_ - 1),
           initialized_(false), last_slot_index_(0) {
         slots_q_.reserve(slots_);
-        for (size_t i = 0; i < slots_; ++i)
+        for (size_t i = 0; i < slots_; ++i){
             slots_q_.emplace_back(std::make_unique<MPMCRing<Entry>>(1 << 14));
+        }
     }
 
-    inline void add(int fd, uint64_t expire_ms) {
+    /*
+     * 加入时间轮意味着active_ms后进行检查，如果在检查时发现距检查点已经过了idle_ms的时间，
+     * 则判定为超时，如果未到idle_ms的时间，那么就在下一个active_ms时再检查，实际上超时的
+	 * 时间是active_ms+idle_ms
+    */
+    inline void add(int fd, uint64_t expire_ms) {   //记录检查的时间，放到对应的槽中
         Entry e{fd, expire_ms};
         size_t idx = slot_index(expire_ms);
         for (int i = 0; i < 64; ++i) {
@@ -827,7 +840,7 @@ public:
     }
 
     template<typename F>
-    void tick(uint64_t now_ms, F on_timeout) {
+    void tick(uint64_t now_ms, F on_timeout) {		//开始检查
         //fprintf(stderr,"tick1\n");
         if (!initialized_.load(std::memory_order_acquire)) {
             size_t idx = (now_ms / tick_ms_) & slot_mask_;
@@ -861,20 +874,35 @@ private:
         }
     }*/
 
+    // template<typename F>
+    // void drain(size_t idx, uint64_t now_ms, F &on_timeout) {
+    //     Entry e;
+    //     while (slots_q_[idx]->dequeue(e)) {
+    //         if (e.expire_ms <= now_ms) {
+    //             on_timeout(e.fd);
+    //         } else {
+    //             // 如果条目计算出来的槽正好是当前正在 drain 的槽，
+    //             // 那么把 expire_ms 向后推进一个 tick，避免被立即再次处理。
+    //             size_t target_idx = slot_index(e.expire_ms);
+    //             if (target_idx == idx) {
+    //                 e.expire_ms += tick_ms_;
+    //             }
+    //             add(e.fd, e.expire_ms);
+    //         }
+    //     }
+    // }
+
     template<typename F>
     void drain(size_t idx, uint64_t now_ms, F &on_timeout) {
         Entry e;
         while (slots_q_[idx]->dequeue(e)) {
             if (e.expire_ms <= now_ms) {
+                // 已到期 → 直接触发
                 on_timeout(e.fd);
             } else {
-                // 如果条目计算出来的槽正好是当前正在 drain 的槽，
-                // 那么把 expire_ms 向后推进一个 tick，避免被立即再次处理。
+                // 还没到期 → 重新放入它对应的槽
                 size_t target_idx = slot_index(e.expire_ms);
-                if (target_idx == idx) {
-                    e.expire_ms += tick_ms_;
-                }
-                add(e.fd, e.expire_ms);
+                slots_q_[target_idx]->enqueue(e);
             }
         }
     }
@@ -1095,12 +1123,6 @@ public:
                         on_writable(conn, conns); // [ET-CRITICAL] write 循环到 EAGAIN 或队列空
                         //logger_->debug("on_writable end");
                     }
-                    uint64_t last = conn->last_active_ms.load(std::memory_order_relaxed);
-                    if (tnow >= last && tnow - last > idle_ms_) {
-                        g_metrics.timeouts.fetch_add(1, std::memory_order_relaxed);
-                        close_conn(conn, conns);
-                        logger_->debug("unexpect 1");
-                    }
                 }
             }
 
@@ -1261,9 +1283,9 @@ private:
             workers_.submit(job);*/
 
             //short time work
-            std::string msg = "receive ";
-            msg.append((char*)stolen->data, hdr.body_len);
-            logger_->debug(msg);
+            //std::string msg = "receive ";
+            //msg.append((char*)stolen->data, hdr.body_len);
+            //logger_->debug(msg);
             business_worker_echo(conn->fd, stolen, hdr.body_len, taskq_);
         }
     }
@@ -1275,11 +1297,11 @@ private:
             if (iov.iov_len == 0)
                 break;
 
-            std::string msg = "send ";
-            msg.append((char*)iov.iov_base, iov.iov_len);
-            logger_->debug(msg);
-
-            ssize_t n = ::write(conn->fd, iov.iov_base, iov.iov_len);
+            //std::string msg = "send ";
+            //msg.append((char*)iov.iov_base, iov.iov_len);
+            //logger_->debug(msg);
+            char* buf = (char*)iov.iov_base;
+            ssize_t n = ::write(conn->fd, /*iov.iov_base*/buf, /*iov.iov_len*/8);
             if (n > 0) {
                 g_metrics.tx_bytes += (uint64_t)n;
                 g_metrics.tx_pkts++;
@@ -1312,11 +1334,12 @@ private:
         auto it = conns.find(fd);
         if (it == conns.end())
             return;
-        if (now_ms() - it->second->last_active_ms > idle_ms_) {
+        if (now_ms() - it->second->last_active_ms > idle_ms_) {     //判定是否超时
             g_metrics.timeouts.fetch_add(1, std::memory_order_relaxed);
             close_conn(it->second, conns);
             logger_->debug("unexpect 6");
         } else {
+            it->second->last_active_ms.store(now_ms(), std::memory_order_relaxed);
             wheel_.add(fd, now_ms() + active_ms_);
         }
     }
