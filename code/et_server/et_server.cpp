@@ -95,6 +95,35 @@ static inline int set_tcp_options(int fd) {
     return 0;
 }
 
+bool add_event(int epfd, int fd, uint32_t events) {
+    struct epoll_event ev;
+    ev.events = events;       // 初始注册的事件
+    ev.data.fd = fd;
+    if (::epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == -1) {
+        assert(0);
+        return false;
+    }
+    return true;
+}
+
+bool mod_event(int epfd, int fd, uint32_t events) {
+    struct epoll_event ev;
+    ev.events = events;
+    ev.data.fd = fd;
+    if (::epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev) == -1) {
+        assert(0);
+        return false;
+    }
+    return true;
+}
+
+void del_event(int epfd, int fd) {
+    if (::epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr) == -1) {
+        assert(0);
+    }
+}
+
+
 void print_time()
 {
     struct timeval tv;
@@ -121,7 +150,7 @@ public:
         uint64_t elapse =  std::chrono::duration_cast<std::chrono::milliseconds>(end_time_ - start_time_).count();
 
         print_time();
-        fprintf(stderr,"%s %llu\n", func_.c_str(), elapse);
+        fprintf(stderr,"%s %lu\n", func_.c_str(), elapse);
     }
 
 private:
@@ -136,9 +165,9 @@ private:
 */
 
 // -------------------------- Config --------------------------
-static const size_t SMALL_BLOCK = 512; // 小块：协议头或小包
-static const size_t LARGE_BLOCK = 4096; // 大块：主体或大包
-static const int MAX_ACCEPT_BATCH = 64; // 每次 accept 最多尝试次数
+static const size_t SMALL_BLOCK = 512; // 小块：协议头或小包512
+static const size_t LARGE_BLOCK = 8096; // 大块：主体或大包4096
+static const int MAX_ACCEPT_BATCH = 128; // 每次 accept 最多尝试次数
 static const size_t OUT_BUFFER_CAP = LARGE_BLOCK; // 出站缓冲区容量（单一 BufferBlock）
 static const uint64_t DEFAULT_IDLE_MS = 30 * 1000;
 static const uint64_t DEFAULT_ACTIVE_MS = 1 * 60 * 1000;
@@ -146,7 +175,7 @@ static const uint64_t DEFAULT_ACTIVE_MS = 1 * 60 * 1000;
 // -------------------------- Metrics --------------------------
 struct Metrics {
     std::atomic<uint64_t> accepted{0}, closed{0}, rx_bytes{0}, tx_bytes{0},
-        rx_pkts{0}, tx_pkts{0}, drops{0}, parse_errors{0}, timeouts{0}, s_pool{0}, l_pool{0}, r_pool{0}, c_pool{0};
+        rx_pkts{0}, tx_pkts{0}, drops{0}, parse_errors{0}, timeouts{0}, s_pool{0}, l_pool{0}, r_pool{0}, c_pool{0}, in_ev{0}, out_ev{0};
 } g_metrics;
 
 static std::string metrics_text() {
@@ -394,8 +423,7 @@ using WorkQueue = WorkQueueWrapper<T>;
 //     uint8_t endian;
 //     uint32_t hdr_crc;
 // };
-
-#pragma pack(pop)
+//#pragma pack(pop)
 #pragma pack(push, 1)
 struct PacketHeader {
     uint8_t body_offset;
@@ -678,11 +706,15 @@ public:
     bool out_push(const OutEntry &e, DualBufferPool &pool) {
         if (!out_buffer) {
             out_buffer = pool.acquire(LARGE_BLOCK);     //分配发送缓冲区
-            if (!out_buffer)
+            if (!out_buffer){
+                assert(0);
                 return false;
+            }
         }
-        if (out_offset + e.len > out_buffer->cap)
+        if (out_offset + e.len > out_buffer->cap){
+            assert(0);
             return false; // 缓冲区不足
+        }
         memcpy(out_buffer->data + out_offset, e.blk->data + e.offset, e.len);
         out_offset += e.len;
         out_len += e.len;
@@ -1091,7 +1123,7 @@ public:
                 int fd = evs[i].data.fd;
                 uint32_t events = evs[i].events;
                 if (fd == listen_fd_) {
-                    //logger_->debug("accept_loop start");
+                    logger_->debug("accept_loop start");
                     accept_loop(conns);
                     //logger_->debug("accept_loop end");
                 } else if (fd == tfd) {
@@ -1114,14 +1146,12 @@ public:
                         continue;
                     }
                     if (events & EPOLLIN){
-                        //logger_->debug("on_readable start");
+                        g_metrics.in_ev.fetch_sub(1, std::memory_order_relaxed);
                         on_readable(conn, conns); // [ET-CRITICAL] read 循环到 EAGAIN
-                        //logger_->debug("on_readable end");
                     }
                     if (events & EPOLLOUT){
-                        //logger_->debug("on_writable start");
+                        g_metrics.out_ev.fetch_sub(1, std::memory_order_relaxed);
                         on_writable(conn, conns); // [ET-CRITICAL] write 循环到 EAGAIN 或队列空
-                        //logger_->debug("on_writable end");
                     }
                 }
             }
@@ -1170,14 +1200,15 @@ private:
 
     // [ET-CRITICAL] 批量 accept：循环最多 MAX_ACCEPT_BATCH 次，并在 EAGAIN 时退出
     void accept_loop(std::unordered_map<int, Connection *> &conns) {
-        //for (int i = 0; i < MAX_ACCEPT_BATCH; ++i) {
-        for (;;) {
+        for (int i = 0; i < MAX_ACCEPT_BATCH; ++i) {
+        //for (;;) {
             sockaddr_in in{};
             socklen_t inlen = sizeof(in);
             int cfd = accept4(listen_fd_, (sockaddr *)&in, &inlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
             if (cfd < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                if (errno == EAGAIN || errno == EWOULDBLOCK){
                     break;
+                }
                 if (errno == EINTR)
                     continue;
                 else
@@ -1191,17 +1222,15 @@ private:
                 logger_->debug("unexpect 7");
                 continue;
             }
-            epoll_event ev{};
-            ev.events = EPOLLIN | EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
-            ev.data.fd = cfd;
-            if (epoll_ctl(epfd_, EPOLL_CTL_ADD, cfd, &ev) < 0) {
-                char* str = strerror(errno);
-                fprintf(stderr, str);
+
+            if (!add_event(epfd_, cfd, EPOLLIN | EPOLLRDHUP | EPOLLET | EPOLLONESHOT)) {
                 assert(0);
                 ::close(cfd);
                 cpool_.release_ref(conn);
                 continue;
             }
+            g_metrics.in_ev.fetch_sub(1, std::memory_order_relaxed);
+
             conns[cfd] = conn;
             g_metrics.accepted.fetch_add(1, std::memory_order_relaxed);
             wheel_.add(cfd, now_ms() + active_ms_);
@@ -1210,10 +1239,15 @@ private:
 
     // [ET-CRITICAL] read 必须拉空直到 EAGAIN
     void on_readable(Connection *conn, std::unordered_map<int, Connection*> &conns) {
+        //logger_->debug("on_readable start");
+
+        bool bNeedRead = false;
         for (;;) {
             iovec w = conn->rx->writable_region(SMALL_BLOCK); // 先用小块读头
-            if (w.iov_len == 0)
+            if (w.iov_len == 0){
+                assert(0);
                 break;
+            }
             ssize_t n = ::read(conn->fd, w.iov_base, w.iov_len);
             if (n > 0) {
                 conn->rx->produce((size_t)n);
@@ -1227,8 +1261,10 @@ private:
                 return;
             }
             if (n < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                if (errno == EAGAIN || errno == EWOULDBLOCK){
+                    bNeedRead = true;
                     break;
+                }
                 if (errno == EINTR)
                     continue;
                 close_conn(conn, conns);
@@ -1239,12 +1275,16 @@ private:
 
         const size_t H = 1 + 4; // magic + body_len + endian + hdr_crc
         while (true) {
-            if (conn->rx->readable_bytes() < H)     //检查可读字节是否少于包头长度
+            if (conn->rx->readable_bytes() < H){     //检查可读字节是否少于包头长度
+                bNeedRead = true;
                 break;
+            }
             uint8_t hdrbuf[5];
             size_t got = conn->rx->peek_bytes(hdrbuf, H);   //获取包头长度字节数据
-            if (got < H)
+            if (got < H){
+                assert(0);
                 break;
+            }
             PacketHeader hdr;
             hdr.body_offset = hdrbuf[0];
             uint32_t bl;
@@ -1258,8 +1298,10 @@ private:
                 close_conn(conn, conns);
                 return;
             }
-            if (conn->rx->readable_bytes() < H + hdr.body_len)  //检查是否是个完整包
+            if (conn->rx->readable_bytes() < H + hdr.body_len){  //检查是否是个完整包
+                bNeedRead = true;
                 break;
+            }
 
             // consume header
             conn->rx->consume(H);
@@ -1288,46 +1330,67 @@ private:
             //logger_->debug(msg);
             business_worker_echo(conn->fd, stolen, hdr.body_len, taskq_);
         }
+
+        // uint32_t events = EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
+        // if(bNeedRead) events |= EPOLLIN;
+        // if (!conn->out_empty()) events |= EPOLLOUT;
+
+        // if(!mod_event(epfd_, conn->fd, events))
+        //     assert(0);
+        //logger_->debug("on_readable end");
     }
 
     // [ET-CRITICAL] write 必须写到 EAGAIN 或队列空
     void on_writable(Connection *conn, std::unordered_map<int, Connection*> &conns) {
+        //logger_->debug("on_writable start");
+
+        bool bNeedWrite = false;
         while (!conn->out_empty()) {
             iovec iov = conn->out_peek();
-            if (iov.iov_len == 0)
+            if (iov.iov_len == 0){
+                assert(0);
                 break;
+            }
 
             //std::string msg = "send ";
             //msg.append((char*)iov.iov_base, iov.iov_len);
             //logger_->debug(msg);
+
             char* buf = (char*)iov.iov_base;
-            ssize_t n = ::write(conn->fd, /*iov.iov_base*/buf, /*iov.iov_len*/8);
+            ssize_t n = ::write(conn->fd, /*iov.iov_base*/buf, /*iov.iov_len*/std::min((size_t)8, iov.iov_len));
             if (n > 0) {
                 g_metrics.tx_bytes += (uint64_t)n;
-                g_metrics.tx_pkts++;
+                g_metrics.tx_pkts.fetch_add(1, std::memory_order_relaxed);
                 conn->out_advance((size_t)n, pool_);
                 continue;
             }
             if (n < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                if (errno == EAGAIN || errno == EWOULDBLOCK){
+                    bNeedWrite = true;
                     break;
+                }
 
                 close_conn(conn, conns);
                 logger_->debug("unexpect 5");
                 return;
             }
         }
-        if (conn->out_empty()) {
-            epoll_event ev{};
-            ev.events = EPOLLIN | EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
-            ev.data.fd = conn->fd;
-            if(epoll_ctl(epfd_, EPOLL_CTL_MOD, conn->fd, &ev) < 0)
-            {
-                char* str = strerror(errno);
-                fprintf(stderr, str);
-                assert(0);
-            }
+
+        uint32_t events = EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
+        g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
+        if (!conn->out_empty()){
+            events |= EPOLLOUT;
+            g_metrics.out_ev.fetch_add(1, std::memory_order_relaxed);
         }
+        else{
+            events |= EPOLLIN;
+            g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        if(!mod_event(epfd_, conn->fd, events))
+            assert(0);
+
+        //logger_->debug("on_writable end");
     }
 
     void on_timeout(int fd, std::unordered_map<int, Connection *> &conns) {
@@ -1454,16 +1517,16 @@ int main(int argc, char **argv) {
     init_logger();
 
     int ncpu = get_nprocs();
-    ncpu = 1;
-    size_t small_blocks = (size_t)ncpu * 1000 * 1000; // 可按内存和连接数调节
-    size_t large_blocks = (size_t)ncpu * 32 * 1000;
+    ncpu = 2;
+    size_t small_blocks = (size_t)ncpu * 32 * 1000; // 可按内存和连接数调节
+    size_t large_blocks = (size_t)ncpu * 16 * 1000;
 
     LOG_INFO("ET-opt server starting on port %u with %d CPUs, small_blocks=%zu, "
              "large_blocks=%zu",
              port, ncpu, small_blocks, large_blocks);
 
     DualBufferPool pool(small_blocks, large_blocks);
-    size_t max_conn = 100000;
+    size_t max_conn = 1000;
     RingBufferPool rpool(max_conn, pool);
     ConnectionPool cpool(max_conn, pool, rpool);
     size_t worker_threads = std::max(1, ncpu * 1);
@@ -1513,7 +1576,7 @@ int main(int argc, char **argv) {
 
             logger_->debug(
                     "acc={} cls={} rx={} tx={} rx/s={:.2f}B "
-                    "tx/s={:.2f}B pkts(rx={} tx={}) drop={} err={} to={} sp={} lp={} rp={} cp={}",
+                    "tx/s={:.2f}B pkts(rx={} tx={}) drop={} err={} to={} sp={} lp={} rp={} cp={} in={} out={}",
                     g_metrics.accepted.load(),
                     g_metrics.closed.load(),
                     rx, tx, rxrate, txrate,
@@ -1525,7 +1588,9 @@ int main(int argc, char **argv) {
                     g_metrics.s_pool.load(),
                     g_metrics.l_pool.load(),
                     g_metrics.r_pool.load(),
-                    g_metrics.c_pool.load());
+                    g_metrics.c_pool.load(),
+                    g_metrics.in_ev.load(),
+                    g_metrics.out_ev.load());
         }
     });
 
