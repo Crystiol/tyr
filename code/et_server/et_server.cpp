@@ -1229,7 +1229,7 @@ private:
                 cpool_.release_ref(conn);
                 continue;
             }
-            g_metrics.in_ev.fetch_sub(1, std::memory_order_relaxed);
+            g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
 
             conns[cfd] = conn;
             g_metrics.accepted.fetch_add(1, std::memory_order_relaxed);
@@ -1331,12 +1331,19 @@ private:
             business_worker_echo(conn->fd, stolen, hdr.body_len, taskq_);
         }
 
-        // uint32_t events = EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
-        // if(bNeedRead) events |= EPOLLIN;
-        // if (!conn->out_empty()) events |= EPOLLOUT;
+        uint32_t events = EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
+        //if(bNeedRead/* || conn->out_empty()*/){
+            events |= EPOLLIN;
+            g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
+        //}
+        if (!conn->out_empty()){
+            events |= EPOLLOUT;
+            g_metrics.out_ev.fetch_add(1, std::memory_order_relaxed);
+        }
 
-        // if(!mod_event(epfd_, conn->fd, events))
-        //     assert(0);
+        if(!mod_event(epfd_, conn->fd, events))
+            assert(0);
+
         //logger_->debug("on_readable end");
     }
 
@@ -1376,19 +1383,25 @@ private:
             }
         }
 
-        uint32_t events = EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
-        g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
-        if (!conn->out_empty()){
-            events |= EPOLLOUT;
-            g_metrics.out_ev.fetch_add(1, std::memory_order_relaxed);
-        }
-        else{
-            events |= EPOLLIN;
-            g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
-        }
+        // uint32_t events = EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
+        // g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
+        // if (!conn->out_empty()){
+        //     events |= EPOLLOUT;
+        //     g_metrics.out_ev.fetch_add(1, std::memory_order_relaxed);
+        // }
+        // else{
+        //     events |= EPOLLIN;
+        //     g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
+        // }
 
-        if(!mod_event(epfd_, conn->fd, events))
-            assert(0);
+        // if(!mod_event(epfd_, conn->fd, events))
+        //     assert(0);
+
+        // uint32_t events = EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
+        // if(conn->out_empty()){
+        //     events |= EPOLLIN;
+        //     g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
+        // }
 
         //logger_->debug("on_writable end");
     }
