@@ -165,8 +165,8 @@ private:
 */
 
 // -------------------------- Config --------------------------
-static const size_t SMALL_BLOCK = 512; // 小块：协议头或小包512
-static const size_t LARGE_BLOCK = 8096; // 大块：主体或大包4096
+static const size_t SMALL_BLOCK = 8192; // 小块：协议头或小包512
+static const size_t LARGE_BLOCK = 8192*2; // 大块：主体或大包4096
 static const int MAX_ACCEPT_BATCH = 128; // 每次 accept 最多尝试次数
 static const size_t OUT_BUFFER_CAP = LARGE_BLOCK; // 出站缓冲区容量（单一 BufferBlock）
 static const uint64_t DEFAULT_IDLE_MS = 30 * 1000;
@@ -572,7 +572,11 @@ public:
 
         // 拷贝 body_len 到 new_block->data
         size_t remain = body_len;
-        size_t copied = 0;
+        size_t copied = 5;
+        uint8_t fix = 5;
+        uint32_t len = 4091;
+        memcpy(new_block->data, &fix, sizeof(fix));
+        memcpy(new_block->data+1, &len, sizeof(len));
         while (remain > 0 && cur) {
             size_t avail = (cur == tail_) ? (tail_off_ - off) : (cur->cap - off);
             size_t take = std::min(avail, remain);
@@ -727,8 +731,8 @@ public:
     iovec out_peek() {
         if (out_empty() || !out_buffer)
             return {nullptr, 0};
-        //return {out_buffer->data, out_len};
-        return {out_buffer->data, 8};			//测试收发，实际上客户端可能一次性读取返回数据，如果采用了类似et的方式
+        return {out_buffer->data, out_len};
+        //return {out_buffer->data, 8};			//测试收发，实际上客户端可能一次性读取返回数据，如果采用了类似et的方式
     }
 
     void out_advance(size_t bytes_written, DualBufferPool &pool) {
@@ -1328,17 +1332,17 @@ private:
             //std::string msg = "receive ";
             //msg.append((char*)stolen->data, hdr.body_len);
             //logger_->debug(msg);
-            business_worker_echo(conn->fd, stolen, hdr.body_len, taskq_);
+            business_worker_echo(conn->fd, stolen, 5 + hdr.body_len, taskq_);
         }
 
         uint32_t events = EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
-        //if(bNeedRead/* || conn->out_empty()*/){
-            events |= EPOLLIN;
-            g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
-        //}
+        events |= EPOLLIN;
+        g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
+
         if (!conn->out_empty()){
             events |= EPOLLOUT;
             g_metrics.out_ev.fetch_add(1, std::memory_order_relaxed);
+            //assert(0);
         }
 
         if(!mod_event(epfd_, conn->fd, events))
@@ -1363,8 +1367,9 @@ private:
             //msg.append((char*)iov.iov_base, iov.iov_len);
             //logger_->debug(msg);
 
-            char* buf = (char*)iov.iov_base;
-            ssize_t n = ::write(conn->fd, /*iov.iov_base*/buf, /*iov.iov_len*/std::min((size_t)8, iov.iov_len));
+            //char* buf = (char*)iov.iov_base;
+            //ssize_t n = ::write(conn->fd, /*iov.iov_base*/buf, /*iov.iov_len*/std::min((size_t)8, iov.iov_len));
+            ssize_t n = ::write(conn->fd, iov.iov_base, iov.iov_len);
             if (n > 0) {
                 g_metrics.tx_bytes += (uint64_t)n;
                 g_metrics.tx_pkts.fetch_add(1, std::memory_order_relaxed);
@@ -1501,6 +1506,7 @@ private:
             fprintf(stderr, str);
             assert(0);
         }
+        g_metrics.in_ev.fetch_sub(1, std::memory_order_relaxed);
         conns.erase(conn->fd);
         cpool_.release_ref(conn);
     }
@@ -1530,16 +1536,16 @@ int main(int argc, char **argv) {
     init_logger();
 
     int ncpu = get_nprocs();
-    ncpu = 2;
-    size_t small_blocks = (size_t)ncpu * 32 * 1000; // 可按内存和连接数调节
-    size_t large_blocks = (size_t)ncpu * 16 * 1000;
+    ncpu = 1;
+    size_t small_blocks = (size_t)ncpu * 32 * 10; // 可按内存和连接数调节
+    size_t large_blocks = (size_t)ncpu * 16 * 10;
 
     LOG_INFO("ET-opt server starting on port %u with %d CPUs, small_blocks=%zu, "
              "large_blocks=%zu",
              port, ncpu, small_blocks, large_blocks);
 
     DualBufferPool pool(small_blocks, large_blocks);
-    size_t max_conn = 1000;
+    size_t max_conn = 10;
     RingBufferPool rpool(max_conn, pool);
     ConnectionPool cpool(max_conn, pool, rpool);
     size_t worker_threads = std::max(1, ncpu * 1);
