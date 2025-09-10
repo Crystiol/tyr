@@ -1147,6 +1147,7 @@ public:
                     auto *conn = it->second;
                     if (events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) {
                         close_conn(conn, conns);
+						g_metrics.in_ev.fetch_sub(1, std::memory_order_relaxed);
                         continue;
                     }
                     if (events & EPOLLIN){
@@ -1506,7 +1507,7 @@ private:
             fprintf(stderr, str);
             assert(0);
         }
-        g_metrics.in_ev.fetch_sub(1, std::memory_order_relaxed);
+        
         conns.erase(conn->fd);
         cpool_.release_ref(conn);
     }
