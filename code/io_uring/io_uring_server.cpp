@@ -1,5 +1,4 @@
 // io_uring_server.cpp
-// Single-file ET optimized server with io_uring (modified to serialize writes)
 #include <algorithm>
 #include <arpa/inet.h>
 #include <atomic>
@@ -89,73 +88,6 @@ static inline int set_tcp_options(int fd) {
 #endif
     return 0;
 }
-
-bool add_event(int epfd, int fd, uint32_t events) {
-    struct epoll_event ev;
-    ev.events = events;
-    ev.data.fd = fd;
-    if (::epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == -1) {
-        assert(0);
-        return false;
-    }
-    return true;
-}
-
-bool mod_event(int epfd, int fd, uint32_t events) {
-    struct epoll_event ev;
-    ev.events = events;
-    ev.data.fd = fd;
-    if (::epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev) == -1) {
-        assert(0);
-        return false;
-    }
-    return true;
-}
-
-void del_event(int epfd, int fd) {
-    if (::epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr) == -1) {
-        assert(0);
-    }
-}
-
-
-void print_time() {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-
-    // 转换为本地时间
-    struct tm tm_info;
-    localtime_r(&tv.tv_sec, &tm_info);
-
-    fprintf(stderr, "[Tid=%-6d %04d-%02d-%02d %02d:%02d:%02d.%03ld] ", gettid(),
-            tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday, tm_info.tm_hour, tm_info.tm_min,
-            tm_info.tm_sec, tv.tv_usec / 1000);
-}
-
-class Elapse {
-public:
-    Elapse(const std::string &func_name) : func_(func_name) {
-        start_time_ = std::chrono::system_clock::now();
-    }
-
-    ~Elapse() {
-        end_time_ = std::chrono::system_clock::now();
-        uint64_t elapse = std::chrono::duration_cast<std::chrono::milliseconds>(end_time_ - start_time_).count();
-
-        print_time();
-        fprintf(stderr, "%s %lu\n", func_.c_str(), elapse);
-    }
-
-private:
-    std::chrono::system_clock::time_point start_time_;
-    std::chrono::system_clock::time_point end_time_;
-    std::string func_;
-};
-
-/*
- * active_ms < idle_ms → 检查更频繁，超时触发更接近真实 idle_ms。
- * active_ms > idle_ms → 检查周期太长，会延迟发现超时，延迟时间最多等于 active_ms。
-*/
 
 // -------------------------- Config --------------------------
 static const size_t SMALL_BLOCK = 512; // 小块：协议头或小包512
