@@ -1,11 +1,5 @@
-// epoll_server_prod_zero_copy_et_opt.cpp
-// 单文件高性能零拷贝 Epoll 服务器（全 ET / 批量 accept / 双层 BufferPool）
-// - 完整实现：BufferPool / RingBuffer / Connection / Reactor / WorkerPool / TimingWheel / metrics
-// - 关键位置已标注 [ET-CRITICAL]
-// - 修正：保留 business_worker_echo 原始签名，添加 ConnectionPool 和 RingBufferPool 对象池，
-//         将 Connection::out_ring 从 std::vector<OutEntry> 改为单一 BufferBlock*，优化大包并减少碎片
-// 编译：g++ -std=c++11 -O2 epoll_server_prod_zero_copy_et_opt.cpp -lpthread -o server
-
+// io_uring_server.cpp
+// Single-file ET optimized server with io_uring (modified to serialize writes)
 #include <algorithm>
 #include <arpa/inet.h>
 #include <atomic>
@@ -52,7 +46,6 @@
 using namespace std::chrono;
 using namespace std::chrono_literals;
 
-// -------------------------- 基础工具 & 日志 --------------------------
 std::shared_ptr<spdlog::logger> logger_;
 void init_logger() {
     auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
@@ -98,7 +91,7 @@ static inline int set_tcp_options(int fd) {
 
 bool add_event(int epfd, int fd, uint32_t events) {
     struct epoll_event ev;
-    ev.events = events;       // 初始注册的事件
+    ev.events = events;
     ev.data.fd = fd;
     if (::epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == -1) {
         assert(0);
@@ -417,20 +410,13 @@ template<typename T>
 using WorkQueue = WorkQueueWrapper<T>;
 
 // -------------------------- 协议头（示例） --------------------------
-// #pragma pack(push, 1)
-// struct PacketHeader {
-//     uint8_t magic;
-//     uint32_t body_len;
-//     uint8_t endian;
-//     uint32_t hdr_crc;
-// };
-//#pragma pack(pop)
 #pragma pack(push, 1)
 struct PacketHeader {
     uint8_t body_offset;
     uint32_t body_len;
 };
 #pragma pack(pop)
+
 // -------------------------- RingBuffer（零拷贝入站，支持双层块） --------------------------
 class RingBuffer {
 public:
@@ -689,6 +675,10 @@ public:
     size_t out_len = 0; // 当前有效数据长度
     std::atomic<uint64_t> last_active_ms{0};
 
+    // ---------- 新增：串行写状态 ----------
+    std::atomic<bool> writing{false};
+    // ---------------------------------------
+
     Connection() {}
 
     void reset(DualBufferPool &p, RingBufferPool &rp) {
@@ -702,6 +692,7 @@ public:
         }
         out_offset = out_len = 0;
         last_active_ms = 0;
+        writing.store(false);
     }
 
     bool out_push(const OutEntry &e, DualBufferPool &pool) {
@@ -728,8 +719,8 @@ public:
     iovec out_peek() {
         if (out_empty() || !out_buffer)
             return {nullptr, 0};
-        //return {out_buffer->data, out_len};
-        return {out_buffer->data, 8};			//测试收发，实际上客户端可能一次性读取返回数据，如果采用了类似et的方式
+        return {out_buffer->data, out_len}; // 修复：返回真实长度
+        //return {out_buffer->data, 8};			//测试收发，实际上客户端可能一次性读取返回数据，如果采用了类似et的方式
     }
 
     void out_advance(size_t bytes_written, DualBufferPool &pool) {
@@ -873,58 +864,24 @@ public:
     }
 
     template<typename F>
-    void tick(uint64_t now_ms, F on_timeout) {		//开始检查
-        //fprintf(stderr,"tick1\n");
+    void tick(uint64_t now_ms, F on_timeout) {
         if (!initialized_.load(std::memory_order_acquire)) {
             size_t idx = (now_ms / tick_ms_) & slot_mask_;
             last_slot_index_.store(idx, std::memory_order_release);
             initialized_.store(true, std::memory_order_release);
             return;
         }
-        //fprintf(stderr,"tick2\n");
         size_t target = (now_ms / tick_ms_) & slot_mask_;
         size_t cur = last_slot_index_.load(std::memory_order_relaxed);
-        //fprintf(stderr,"tick2.1\n");
         while (cur != target) {
             drain(cur, now_ms, on_timeout);
             cur = (cur + 1) & slot_mask_;
         }
-        //fprintf(stderr,"tick3\n");
         last_slot_index_.store(cur, std::memory_order_relaxed);
         drain_light(cur, now_ms, on_timeout);
-        //fprintf(stderr,"tick4\n");
     }
 
 private:
-    /*template<typename F>
-    void drain(size_t idx, uint64_t now_ms, F &on_timeout) {
-        Entry e;
-        while (slots_q_[idx]->dequeue(e)) {
-            if (e.expire_ms <= now_ms)
-                on_timeout(e.fd);
-            else
-                add(e.fd, e.expire_ms);
-        }
-    }*/
-
-    // template<typename F>
-    // void drain(size_t idx, uint64_t now_ms, F &on_timeout) {
-    //     Entry e;
-    //     while (slots_q_[idx]->dequeue(e)) {
-    //         if (e.expire_ms <= now_ms) {
-    //             on_timeout(e.fd);
-    //         } else {
-    //             // 如果条目计算出来的槽正好是当前正在 drain 的槽，
-    //             // 那么把 expire_ms 向后推进一个 tick，避免被立即再次处理。
-    //             size_t target_idx = slot_index(e.expire_ms);
-    //             if (target_idx == idx) {
-    //                 e.expire_ms += tick_ms_;
-    //             }
-    //             add(e.fd, e.expire_ms);
-    //         }
-    //     }
-    // }
-
     template<typename F>
     void drain(size_t idx, uint64_t now_ms, F &on_timeout) {
         Entry e;
@@ -1042,7 +999,6 @@ private:
 };
 
 // -------------------------- Reactor（ET 核心） --------------------------
-// 将下面这个类替换掉原文件中的 Reactor 类实现
 class Reactor {
 public:
     Reactor(int cpu_id, int listen_fd, DualBufferPool &pool,
@@ -1053,24 +1009,21 @@ public:
           wheel_(100, 1024) {
         struct io_uring_params params;
         memset(&params, 0, sizeof(params));
-        io_uring_queue_init_params(128, &ring_, &params); // will be initialized in run()
+        io_uring_queue_init_params(128, &ring_, &params);
     }
 
     ~Reactor() {
-        // ensure ring cleaned if constructed
     }
 
     void run() {
         pin_cpu(cpu_id_);
 
-        // init io_uring
         struct io_uring_params params;
         memset(&params, 0, sizeof(params));
         if (io_uring_queue_init_params(4096, &ring_, &params) < 0) {
             die("io_uring_queue_init_params");
         }
 
-        // create timerfd for timingwheel ticks (we still use timerfd)
         tfd_ = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
         if (tfd_ < 0) die("timerfd_create");
         itimerspec its{};
@@ -1078,7 +1031,6 @@ public:
         its.it_value = its.it_interval;
         timerfd_settime(tfd_, 0, &its, nullptr);
 
-        // metrics socket (loopback) - try to bind/listen and we will accept it via io_uring
         metrics_fd_ = -1;
         int mfd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (mfd >= 0) {
@@ -1095,27 +1047,18 @@ public:
             }
         }
 
-        // structures
         std::unordered_map<int, Connection *> conns;
         logger_->debug("run using io_uring");
 
-        // submit initial accept on listen_fd
         submit_accept();
-
-        // submit initial read on timerfd so we get ticks via completions
         submit_read_fd(tfd_, nullptr, sizeof(uint64_t), EventTag::TIMER);
-
-        // if we have metrics listener, submit accept for it
         if (metrics_fd_ >= 0) {
             submit_accept_fd(metrics_fd_, EventTag::METRICS_LISTEN, nullptr);
         }
 
-        // main loop
         while (!global_stop_.load()) {
-            // 1) 先处理 worker 发回的响应（减少尾延迟）
             process_incoming_tasks_and_submit_writes(conns);
 
-            // 2) 调用 io_uring_wait_cqe 或 io_uring_submit_and_wait(1) 以获得至少一个完成
             struct io_uring_cqe *cqe = nullptr;
             int ret = io_uring_submit_and_wait(&ring_, 1);
             if (ret < 0) {
@@ -1164,11 +1107,12 @@ private:
 
     struct IoUser {
         EventTag tag;
-        int fd; // target fd (for some ops)
-        Connection *conn; // optional, for READ/WRITE
+        int fd;
+        Connection *conn;
+        struct iovec *piov;
+        IoUser(EventTag t=EventTag::READ, int f=-1, Connection* c=nullptr) : tag(t), fd(f), conn(c), piov(nullptr) {}
     };
 
-    // submit helper: allocate sqe and attach IoUser via user_data pointer
     void submit_accept() {
         submit_accept_fd(listen_fd_, EventTag::ACCEPT, nullptr);
     }
@@ -1176,7 +1120,6 @@ private:
     void submit_accept_fd(int fd, EventTag tag, void* userptr) {
         struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
         if (!sqe) {
-            // ring full -> submit and retry
             io_uring_submit(&ring_);
             sqe = io_uring_get_sqe(&ring_);
             if (!sqe) die("get_sqe accept");
@@ -1188,43 +1131,50 @@ private:
     }
 
     void submit_read_fd(int fd, Connection *conn, size_t len, EventTag tag) {
-        // prepare a read into a small stack buffer or into RingBuffer writable region
-        // For timerfd and metrics we read into small stack buffer; for connection->rx use iovec from RingBuffer
         if (tag == EventTag::TIMER || tag == EventTag::METRICS_READ) {
             uint64_t *buf = new uint64_t;
             struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
             if (!sqe) { io_uring_submit(&ring_); sqe = io_uring_get_sqe(&ring_); if (!sqe) die("get_sqe readfd"); }
             IoUser *u = new IoUser{tag, fd, nullptr};
+            // store pointer to buffer in piov (abuse) - but we'll not try to delete via piov for timer; track specially
+            u->piov = nullptr;
             io_uring_prep_read(sqe, fd, buf, sizeof(uint64_t), 0);
             io_uring_sqe_set_data(sqe, u);
             io_uring_submit(&ring_);
             return;
         }
 
-        // connection io read (use readv into ringbuffer region)
         iovec w = conn->rx->writable_region(SMALL_BLOCK);
-        if (w.iov_len == 0) return; // shouldn't happen
+        if (w.iov_len == 0) return;
         struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
         if (!sqe) { io_uring_submit(&ring_); sqe = io_uring_get_sqe(&ring_); if (!sqe) die("get_sqe readv"); }
         IoUser *u = new IoUser{EventTag::READ, conn->fd, conn};
         struct iovec *iov = new struct iovec;
         *iov = w;
+        u->piov = iov;
         io_uring_prep_readv(sqe, conn->fd, iov, 1, 0);
         io_uring_sqe_set_data(sqe, u);
-        // store iov pointer in u->conn temporarily via conn pointer? we'll delete iov after completion
         io_uring_submit(&ring_);
     }
 
     void submit_write(Connection *conn) {
         if (conn->out_empty()) return;
+        bool expected = false;
+        if (!conn->writing.compare_exchange_strong(expected, true)) {
+            return; // already a write in-flight
+        }
+
         iovec iov = conn->out_peek();
-        if (iov.iov_len == 0) return;
+        if (iov.iov_len == 0) {
+            conn->writing.store(false);
+            return;
+        }
         struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
         if (!sqe) { io_uring_submit(&ring_); sqe = io_uring_get_sqe(&ring_); if (!sqe) die("get_sqe write"); }
         IoUser *u = new IoUser{EventTag::WRITE, conn->fd, conn};
-        // allocate iovec copy on heap so it survives until completion
         struct iovec *piov = new struct iovec;
         *piov = iov;
+        u->piov = piov;
         io_uring_prep_writev(sqe, conn->fd, piov, 1, 0);
         io_uring_sqe_set_data(sqe, u);
         io_uring_submit(&ring_);
@@ -1284,7 +1234,8 @@ private:
             }
             case EventTag::READ: {
                 Connection *conn = u->conn;
-                if (!conn) { delete u; break; }
+                struct iovec *iov_ptr = u->piov;
+                if (!conn) { if (iov_ptr) delete iov_ptr; delete u; break; }
                 if (res > 0) {
                     // consumed res bytes into conn->rx: we must adjust ringbuffer's produce
                     conn->rx->produce((size_t)res);
@@ -1341,32 +1292,33 @@ private:
                     Connection *maybe = conns[u->fd];
                     if (maybe) submit_read_fd(u->fd, maybe, SMALL_BLOCK, EventTag::READ);
                 }
+
+                if (iov_ptr) delete iov_ptr;
                 break;
             }
             case EventTag::WRITE: {
                 Connection *conn = u->conn;
-                if (!conn) { delete u; break; }
+                struct iovec *piov_ptr = u->piov;
+                if (!conn) { if (piov_ptr) delete piov_ptr; delete u; break; }
                 if (res >= 0) {
                     g_metrics.tx_bytes += (uint64_t)res;
                     g_metrics.tx_pkts.fetch_add(1, std::memory_order_relaxed);
                     conn->out_advance((size_t)res, pool_);
-                    // if still data, resubmit write
+                    conn->writing.store(false, std::memory_order_release);
                     if (!conn->out_empty()) {
                         submit_write(conn);
                     }
                 } else {
+                    conn->writing.store(false, std::memory_order_release);
                     if (res == -EAGAIN || res == -EWOULDBLOCK) {
-                        // will try later (no epoll needed)
                     } else {
                         close_conn(conn, conns);
                     }
                 }
+                if (piov_ptr) delete piov_ptr;
                 break;
             }
             case EventTag::METRICS_READ: {
-                // metrics read: similar to old serve_metrics but simplified
-                // we allocated a uint64_t pointer for read; find the fd from u->fd and then accept served connection earlier
-                // ignore for now
                 break;
             }
             default:
@@ -1392,8 +1344,7 @@ private:
                 continue;
             }
             pool_.release_ref(t.entry.blk);
-            // submit write via io_uring
-            submit_write(conn);
+            submit_write(conn); // submit_write 会自行检查 writing 标志
         }
     }
 
