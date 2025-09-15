@@ -47,6 +47,7 @@ using namespace std::chrono;
 using namespace std::chrono_literals;
 
 std::shared_ptr<spdlog::logger> logger_;
+
 void init_logger() {
     auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
     console_sink->set_level(spdlog::level::debug);
@@ -118,8 +119,7 @@ void del_event(int epfd, int fd) {
 }
 
 
-void print_time()
-{
+void print_time() {
     struct timeval tv;
     gettimeofday(&tv, NULL);
 
@@ -127,24 +127,23 @@ void print_time()
     struct tm tm_info;
     localtime_r(&tv.tv_sec, &tm_info);
 
-    fprintf(stderr,"[Tid=%-6d %04d-%02d-%02d %02d:%02d:%02d.%03ld] ", gettid(),
-            tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday, tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, tv.tv_usec / 1000);
+    fprintf(stderr, "[Tid=%-6d %04d-%02d-%02d %02d:%02d:%02d.%03ld] ", gettid(),
+            tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday, tm_info.tm_hour, tm_info.tm_min,
+            tm_info.tm_sec, tv.tv_usec / 1000);
 }
 
-class Elapse
-{
+class Elapse {
 public:
-    Elapse(const std::string& func_name) : func_(func_name){
+    Elapse(const std::string &func_name) : func_(func_name) {
         start_time_ = std::chrono::system_clock::now();
     }
 
-    ~Elapse()
-    {
-        end_time_= std::chrono::system_clock::now();
-        uint64_t elapse =  std::chrono::duration_cast<std::chrono::milliseconds>(end_time_ - start_time_).count();
+    ~Elapse() {
+        end_time_ = std::chrono::system_clock::now();
+        uint64_t elapse = std::chrono::duration_cast<std::chrono::milliseconds>(end_time_ - start_time_).count();
 
         print_time();
-        fprintf(stderr,"%s %lu\n", func_.c_str(), elapse);
+        fprintf(stderr, "%s %lu\n", func_.c_str(), elapse);
     }
 
 private:
@@ -169,7 +168,8 @@ static const uint64_t DEFAULT_ACTIVE_MS = 1 * 60 * 1000;
 // -------------------------- Metrics --------------------------
 struct Metrics {
     std::atomic<uint64_t> accepted{0}, closed{0}, rx_bytes{0}, tx_bytes{0},
-        rx_pkts{0}, tx_pkts{0}, drops{0}, parse_errors{0}, timeouts{0}, s_pool{0}, l_pool{0}, r_pool{0}, c_pool{0}, in_ev{0}, out_ev{0};
+            rx_pkts{0}, tx_pkts{0}, drops{0}, parse_errors{0}, timeouts{0}, s_pool{0}, l_pool{0}, r_pool{0}, c_pool{0},
+            in_ev{0}, out_ev{0};
 } g_metrics;
 
 static std::string metrics_text() {
@@ -188,19 +188,19 @@ static std::string metrics_text() {
                      "large_pool %llu\n"
                      "ring_pool %llu\n"
                      "conn_pool %llu\n",
-                     (unsigned long long)g_metrics.accepted.load(),
-                     (unsigned long long)g_metrics.closed.load(),
-                     (unsigned long long)g_metrics.rx_bytes.load(),
-                     (unsigned long long)g_metrics.tx_bytes.load(),
-                     (unsigned long long)g_metrics.rx_pkts.load(),
-                     (unsigned long long)g_metrics.tx_pkts.load(),
-                     (unsigned long long)g_metrics.drops.load(),
-                     (unsigned long long)g_metrics.parse_errors.load(),
-                     (unsigned long long)g_metrics.timeouts.load(),
-                     (unsigned long long)g_metrics.s_pool.load(),
-                     (unsigned long long)g_metrics.l_pool.load(),
-                     (unsigned long long)g_metrics.r_pool.load(),
-                     (unsigned long long)g_metrics.c_pool.load());
+                     (unsigned long long) g_metrics.accepted.load(),
+                     (unsigned long long) g_metrics.closed.load(),
+                     (unsigned long long) g_metrics.rx_bytes.load(),
+                     (unsigned long long) g_metrics.tx_bytes.load(),
+                     (unsigned long long) g_metrics.rx_pkts.load(),
+                     (unsigned long long) g_metrics.tx_pkts.load(),
+                     (unsigned long long) g_metrics.drops.load(),
+                     (unsigned long long) g_metrics.parse_errors.load(),
+                     (unsigned long long) g_metrics.timeouts.load(),
+                     (unsigned long long) g_metrics.s_pool.load(),
+                     (unsigned long long) g_metrics.l_pool.load(),
+                     (unsigned long long) g_metrics.r_pool.load(),
+                     (unsigned long long) g_metrics.c_pool.load());
     return std::string(buf, n);
 }
 
@@ -218,7 +218,7 @@ static inline uint32_t crc32_calc(const void *data, size_t len) {
         init = true;
     }
     uint32_t c = 0xFFFFFFFFu;
-    const uint8_t *p = (const uint8_t *)data;
+    const uint8_t *p = (const uint8_t *) data;
     for (size_t i = 0; i < len; ++i)
         c = table[(c ^ p[i]) & 0xFFu] ^ (c >> 8);
     return c ^ 0xFFFFFFFFu;
@@ -239,7 +239,7 @@ public:
     BufferPoolBase(size_t block_size, size_t total_blocks) : bs_(block_size) {
         storage_.reserve(total_blocks);
         backing_.reserve(total_blocks * block_size);
-        for (size_t i = 0; i < total_blocks; ++i){
+        for (size_t i = 0; i < total_blocks; ++i) {
             storage_.emplace_back(std::make_unique<BufferBlock>());
         }
 
@@ -286,7 +286,7 @@ public:
 
 private:
     size_t bs_;
-    std::vector<std::unique_ptr<BufferBlock>> storage_;
+    std::vector<std::unique_ptr<BufferBlock> > storage_;
     std::vector<uint8_t> backing_;
     std::atomic<BufferBlock *> freelist_;
 };
@@ -301,7 +301,7 @@ public:
 
     BufferBlock *acquire(size_t expect) {
         if (expect <= small_.block_size()) {
-            if (auto b = small_.acquire()){
+            if (auto b = small_.acquire()) {
                 g_metrics.s_pool.fetch_sub(1, std::memory_order_relaxed);
                 return b;
             }
@@ -317,7 +317,9 @@ public:
     void release_ref(BufferBlock *b) {
         bool bRet = (b->cap == SMALL_BLOCK ? small_ : large_).release_ref(b);
         if (bRet)
-            b->cap == SMALL_BLOCK ? g_metrics.s_pool.fetch_add(1, std::memory_order_relaxed) : g_metrics.l_pool.fetch_add(1, std::memory_order_relaxed);
+            b->cap == SMALL_BLOCK
+                ? g_metrics.s_pool.fetch_add(1, std::memory_order_relaxed)
+                : g_metrics.l_pool.fetch_add(1, std::memory_order_relaxed);
     }
 
 private:
@@ -345,7 +347,7 @@ public:
         for (;;) {
             e = entries_[pos & mask_].get();
             size_t seq = e->seq.load(std::memory_order_acquire);
-            intptr_t dif = (intptr_t)seq - (intptr_t)pos;
+            intptr_t dif = (intptr_t) seq - (intptr_t) pos;
             if (dif == 0) {
                 if (head_.compare_exchange_weak(pos, pos + 1)) {
                     e->val = v;
@@ -366,7 +368,7 @@ public:
         for (;;) {
             e = entries_[pos & mask_].get();
             size_t seq = e->seq.load(std::memory_order_acquire);
-            intptr_t dif = (intptr_t)seq - (intptr_t)(pos + 1);
+            intptr_t dif = (intptr_t) seq - (intptr_t) (pos + 1);
             if (dif == 0) {
                 if (tail_.compare_exchange_weak(pos, pos + 1)) {
                     out = e->val;
@@ -386,10 +388,11 @@ private:
         std::atomic<size_t> seq;
         T val;
 
-        Entry(size_t s) : seq(s), val() {}
+        Entry(size_t s) : seq(s), val() {
+        }
     };
 
-    std::vector<std::unique_ptr<Entry>> entries_;
+    std::vector<std::unique_ptr<Entry> > entries_;
     size_t size_, mask_;
     std::atomic<size_t> head_, tail_;
 };
@@ -397,7 +400,8 @@ private:
 template<typename T>
 class WorkQueueWrapper {
 public:
-    WorkQueueWrapper() : q_(1 << 12) {}
+    WorkQueueWrapper() : q_(1 << 12) {
+    }
 
     bool push(const T &v) { return q_.enqueue(v); }
     bool pop(T &o) { return q_.dequeue(o); }
@@ -498,9 +502,9 @@ public:
             }
             remain -= avail;
             BufferBlock *old = head_;
-            head_ = old->next;          //head指向下一块
-            pool_.release_ref(old);     //回收已读完的块
-            head_off_ = 0;              //下一块的起始地址必定为0，因为还没有被cosume
+            head_ = old->next; //head指向下一块
+            pool_.release_ref(old); //回收已读完的块
+            head_off_ = 0; //下一块的起始地址必定为0，因为还没有被cosume
             if (!head_) {
                 tail_ = nullptr;
                 tail_off_ = 0;
@@ -518,7 +522,8 @@ public:
         size_t cnt = 0;
         BufferBlock *cur = head_;
         size_t off = head_off_;
-        while (cur) {       //多个块的情形，剩余空间+新块已用
+        while (cur) {
+            //多个块的情形，剩余空间+新块已用
             if (cur == tail_) {
                 cnt += tail_off_ - off;
                 break;
@@ -596,14 +601,14 @@ private:
             head_ = tail_ = b;
             head_off_ = tail_off_ = 0;
         } else {
-            tail_->next = b;        //将新块链接在当前块后边
+            tail_->next = b; //将新块链接在当前块后边
             tail_ = b;
         }
     }
 
     void ensure_tail(size_t hint) {
         if (!tail_ || tail_off_ >= tail_->cap - 1) {
-            append_block(hint);     //未分配块或块已满则分配新块
+            append_block(hint); //未分配块或块已满则分配新块
             tail_off_ = 0;
         }
     }
@@ -653,7 +658,7 @@ public:
 
 private:
     DualBufferPool &dp_;
-    std::vector<std::unique_ptr<RingBuffer>> storage_;
+    std::vector<std::unique_ptr<RingBuffer> > storage_;
     std::atomic<RingBuffer *> freelist_;
 };
 
@@ -679,7 +684,8 @@ public:
     std::atomic<bool> writing{false};
     // ---------------------------------------
 
-    Connection() {}
+    Connection() {
+    }
 
     void reset(DualBufferPool &p, RingBufferPool &rp) {
         if (fd >= 0) ::close(fd);
@@ -697,20 +703,20 @@ public:
 
     bool out_push(const OutEntry &e, DualBufferPool &pool) {
         if (!out_buffer) {
-            out_buffer = pool.acquire(LARGE_BLOCK);     //分配发送缓冲区
-            if (!out_buffer){
+            out_buffer = pool.acquire(LARGE_BLOCK); //分配发送缓冲区
+            if (!out_buffer) {
                 assert(0);
                 return false;
             }
         }
-        if (out_offset + e.len > out_buffer->cap){
+        if (out_offset + e.len > out_buffer->cap) {
             assert(0);
             return false; // 缓冲区不足
         }
         memcpy(out_buffer->data + out_offset, e.blk->data + e.offset, e.len);
         out_offset += e.len;
         out_len += e.len;
-        pool.retain(out_buffer);    //add发送缓冲区计数，可以避免再次分配
+        pool.retain(out_buffer); //add发送缓冲区计数，可以避免再次分配
         return true;
     }
 
@@ -728,7 +734,7 @@ public:
             out_len = 0;
             out_offset = 0;
             if (out_buffer) {
-                pool.release_ref(out_buffer);            //回收发送缓冲区
+                pool.release_ref(out_buffer); //回收发送缓冲区
                 //out_buffer = nullptr;       //如果out_push中调用了pool.retain(out_buffer)，则不应该赋空
             }
         } else {
@@ -756,13 +762,13 @@ public:
     }
 
     bool admit(int fd, Connection **out_conn) {
-        if (active_.load(std::memory_order_relaxed) >= max_active_){
+        if (active_.load(std::memory_order_relaxed) >= max_active_) {
             logger_->debug("admit 1");
             return false;
         }
 
         Connection *conn = acquire();
-        if (!conn){
+        if (!conn) {
             logger_->debug("admit 2");
             return false;
         }
@@ -775,7 +781,7 @@ public:
         }
 
         conn->fd = fd;
-        conn->rx = rb;      //为连接分配接收缓冲区rx
+        conn->rx = rb; //为连接分配接收缓冲区rx
         conn->last_active_ms.store(now_ms(), std::memory_order_relaxed);
         *out_conn = conn;
         return true;
@@ -802,7 +808,7 @@ private:
             if (active_.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel))
                 break;
         }
-        if (cur >= max_active_){
+        if (cur >= max_active_) {
             logger_->debug("acquire 1");
             return nullptr;
         }
@@ -825,7 +831,7 @@ private:
     DualBufferPool &dp_;
     RingBufferPool &rp_;
     size_t max_active_;
-    std::vector<std::unique_ptr<Connection>> storage_;
+    std::vector<std::unique_ptr<Connection> > storage_;
     std::atomic<Connection *> freelist_;
     std::atomic<size_t> active_{0};
 };
@@ -842,8 +848,8 @@ public:
         : tick_ms_(tick_ms), slots_(normalize_pow2(slots)), slot_mask_(slots_ - 1),
           initialized_(false), last_slot_index_(0) {
         slots_q_.reserve(slots_);
-        for (size_t i = 0; i < slots_; ++i){
-            slots_q_.emplace_back(std::make_unique<MPMCRing<Entry>>(1 << 14));
+        for (size_t i = 0; i < slots_; ++i) {
+            slots_q_.emplace_back(std::make_unique<MPMCRing<Entry> >(1 << 14));
         }
     }
 
@@ -852,7 +858,8 @@ public:
      * 则判定为超时，如果未到idle_ms的时间，那么就在下一个active_ms时再检查，实际上超时的
 	 * 时间是active_ms+idle_ms
     */
-    inline void add(int fd, uint64_t expire_ms) {   //记录检查的时间，放到对应的槽中
+    inline void add(int fd, uint64_t expire_ms) {
+        //记录检查的时间，放到对应的槽中
         Entry e{fd, expire_ms};
         size_t idx = slot_index(expire_ms);
         for (int i = 0; i < 64; ++i) {
@@ -923,7 +930,7 @@ private:
 
     const uint64_t tick_ms_;
     const size_t slots_, slot_mask_;
-    std::vector<std::unique_ptr<MPMCRing<Entry>>> slots_q_;
+    std::vector<std::unique_ptr<MPMCRing<Entry> > > slots_q_;
     std::atomic<bool> initialized_;
     std::atomic<size_t> last_slot_index_;
 };
@@ -936,7 +943,8 @@ struct ResponseTask {
 
 class TaskQueue {
 public:
-    TaskQueue() : q_(1 << 14) {}
+    TaskQueue() : q_(1 << 14) {
+    }
 
     bool enqueue(const ResponseTask &t) { return q_.enqueue(t); }
     bool dequeue(ResponseTask &o) { return q_.dequeue(o); }
@@ -951,7 +959,7 @@ business_worker_echo(int fd, BufferBlock *stolen_block, size_t body_len, TaskQue
     ResponseTask t;
     t.fd = fd;
     t.entry = {stolen_block, 0, body_len};
-    while (!reactor_queue.enqueue(t)){
+    while (!reactor_queue.enqueue(t)) {
         std::this_thread::yield();
     }
 }
@@ -967,12 +975,12 @@ public:
 
     ~WorkerPool() {
         stop_.store(true);
-        for (auto &t : threads_)
+        for (auto &t: threads_)
             t.join();
     }
 
     void submit(Job j) {
-        while (!queue_push(j)){
+        while (!queue_push(j)) {
             std::this_thread::yield();
         }
     }
@@ -983,10 +991,9 @@ private:
     void loop() {
         Job j;
         while (!stop_.load()) {
-            if (queue_pop(j)){
+            if (queue_pop(j)) {
                 j();
-            }
-            else{
+            } else {
                 std::this_thread::yield();
             }
         }
@@ -998,14 +1005,79 @@ private:
     WorkQueue<Job> queue_;
 };
 
+enum class EventTag : uint64_t {
+    ACCEPT = 1,
+    READ = 2,
+    WRITE = 3,
+    TIMER = 4,
+    METRICS_ACCEPT = 5,
+    METRICS_READ = 6,
+    METRICS_LISTEN = 7
+};
+
+// -------------------------- IoUserPool --------------------------
+struct IoUser {
+    EventTag tag;
+    int fd;
+    Connection *conn;
+    struct iovec iov;
+    IoUser *next;
+
+    IoUser() : tag(EventTag::READ), fd(-1), conn(nullptr), iov{nullptr, 0}, next(nullptr) {
+    }
+};
+
+#define IOVEC_EMPTY(iov) ((!(iov).iov_base) || ((iov).iov_len) == 0)
+
+class IoUserPool {
+public:
+    IoUserPool(size_t total) {
+        storage_.resize(total);
+        for (size_t i = 0; i < total; ++i) {
+            storage_[i] = std::make_unique<IoUser>();
+        }
+        for (size_t i = 0; i + 1 < total; ++i) {
+            storage_[i]->next = storage_[i + 1].get();
+        }
+        freelist_.store(storage_[0].get(), std::memory_order_release);
+    }
+
+    IoUser *acquire() {
+        IoUser *h = freelist_.load(std::memory_order_acquire);
+        while (h) {
+            IoUser *nxt = h->next;
+            if (freelist_.compare_exchange_weak(h, nxt, std::memory_order_acq_rel)) {
+                h->next = nullptr;
+                return h;
+            }
+        }
+        return nullptr; // 池耗尽
+    }
+
+    void release(IoUser *u) {
+        if (!u) return;
+        u->conn = nullptr;
+        u->iov = {nullptr, 0};
+        IoUser *head = freelist_.load(std::memory_order_relaxed);
+        do {
+            u->next = head;
+        } while (!freelist_.compare_exchange_weak(
+            head, u, std::memory_order_release, std::memory_order_relaxed));
+    }
+
+private:
+    std::vector<std::unique_ptr<IoUser> > storage_;
+    std::atomic<IoUser *> freelist_;
+};
+
 // -------------------------- Reactor（ET 核心） --------------------------
 class Reactor {
 public:
     Reactor(int cpu_id, int listen_fd, DualBufferPool &pool,
-            ConnectionPool &cpool, WorkerPool &workers, uint64_t idle_ms,
+            ConnectionPool &cpool, WorkerPool &workers, IoUserPool &io_pool, uint64_t idle_ms,
             uint64_t active_ms)
         : cpu_id_(cpu_id), listen_fd_(listen_fd), pool_(pool), cpool_(cpool),
-          workers_(workers), idle_ms_(idle_ms), active_ms_(active_ms), taskq_(),
+          workers_(workers), user_pool_(io_pool), idle_ms_(idle_ms), active_ms_(active_ms), taskq_(),
           wheel_(100, 1024) {
         struct io_uring_params params;
         memset(&params, 0, sizeof(params));
@@ -1040,7 +1112,7 @@ public:
             ma.sin_family = AF_INET;
             ma.sin_port = htons(metrics_port_);
             ma.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            if (bind(mfd, (sockaddr *)&ma, sizeof ma) == 0 && listen(mfd, 64) == 0) {
+            if (bind(mfd, (sockaddr *) &ma, sizeof ma) == 0 && listen(mfd, 64) == 0) {
                 metrics_fd_ = mfd;
             } else {
                 close(mfd);
@@ -1080,7 +1152,7 @@ public:
 
         // cleanup
         logger_->debug("clean");
-        for (auto &p : conns) {
+        for (auto &p: conns) {
             close_conn(p.second, conns);
         }
         if (metrics_fd_ >= 0) close(metrics_fd_);
@@ -1094,37 +1166,23 @@ public:
     bool enqueue_response(const ResponseTask &t) { return taskq_.enqueue(t); }
 
 private:
-    // small enum to tag operations in user_data
-    enum class EventTag : uint64_t {
-        ACCEPT = 1,
-        READ = 2,
-        WRITE = 3,
-        TIMER = 4,
-        METRICS_ACCEPT = 5,
-        METRICS_READ = 6,
-        METRICS_LISTEN = 7
-    };
-
-    struct IoUser {
-        EventTag tag;
-        int fd;
-        Connection *conn;
-        struct iovec *piov;
-        IoUser(EventTag t=EventTag::READ, int f=-1, Connection* c=nullptr) : tag(t), fd(f), conn(c), piov(nullptr) {}
-    };
-
     void submit_accept() {
         submit_accept_fd(listen_fd_, EventTag::ACCEPT, nullptr);
     }
 
-    void submit_accept_fd(int fd, EventTag tag, void* userptr) {
+    void submit_accept_fd(int fd, EventTag tag, void *userptr) {
         struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
         if (!sqe) {
             io_uring_submit(&ring_);
             sqe = io_uring_get_sqe(&ring_);
             if (!sqe) die("get_sqe accept");
         }
-        IoUser *u = new IoUser{tag, fd, nullptr};
+        IoUser *u = user_pool_.acquire();
+        if (!u) die("IoUser pool exhausted");
+        u->tag = tag;
+        u->fd = fd;
+        u->conn = nullptr;
+
         io_uring_prep_accept(sqe, fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
         io_uring_sqe_set_data(sqe, u);
         io_uring_submit(&ring_);
@@ -1134,10 +1192,18 @@ private:
         if (tag == EventTag::TIMER || tag == EventTag::METRICS_READ) {
             uint64_t *buf = new uint64_t;
             struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
-            if (!sqe) { io_uring_submit(&ring_); sqe = io_uring_get_sqe(&ring_); if (!sqe) die("get_sqe readfd"); }
-            IoUser *u = new IoUser{tag, fd, nullptr};
-            // store pointer to buffer in piov (abuse) - but we'll not try to delete via piov for timer; track specially
-            u->piov = nullptr;
+            if (!sqe) {
+                io_uring_submit(&ring_);
+                sqe = io_uring_get_sqe(&ring_);
+                if (!sqe) die("get_sqe readfd");
+            }
+
+            IoUser *u = user_pool_.acquire();
+            if (!u) die("IoUser pool exhausted");
+            u->tag = tag;
+            u->fd = fd;
+            u->conn = conn;
+
             io_uring_prep_read(sqe, fd, buf, sizeof(uint64_t), 0);
             io_uring_sqe_set_data(sqe, u);
             io_uring_submit(&ring_);
@@ -1147,12 +1213,20 @@ private:
         iovec w = conn->rx->writable_region(SMALL_BLOCK);
         if (w.iov_len == 0) return;
         struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
-        if (!sqe) { io_uring_submit(&ring_); sqe = io_uring_get_sqe(&ring_); if (!sqe) die("get_sqe readv"); }
-        IoUser *u = new IoUser{EventTag::READ, conn->fd, conn};
-        struct iovec *iov = new struct iovec;
-        *iov = w;
-        u->piov = iov;
-        io_uring_prep_readv(sqe, conn->fd, iov, 1, 0);
+        if (!sqe) {
+            io_uring_submit(&ring_);
+            sqe = io_uring_get_sqe(&ring_);
+            if (!sqe) die("get_sqe readv");
+        }
+
+        IoUser *u = user_pool_.acquire();
+        if (!u) die("IoUser pool exhausted");
+        u->tag = EventTag::READ;
+        u->fd = conn->fd;
+        u->conn = conn;
+        u->iov = w;
+
+        io_uring_prep_readv(sqe, conn->fd, &u->iov, 1, 0);
         io_uring_sqe_set_data(sqe, u);
         io_uring_submit(&ring_);
     }
@@ -1170,12 +1244,20 @@ private:
             return;
         }
         struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
-        if (!sqe) { io_uring_submit(&ring_); sqe = io_uring_get_sqe(&ring_); if (!sqe) die("get_sqe write"); }
-        IoUser *u = new IoUser{EventTag::WRITE, conn->fd, conn};
-        struct iovec *piov = new struct iovec;
-        *piov = iov;
-        u->piov = piov;
-        io_uring_prep_writev(sqe, conn->fd, piov, 1, 0);
+        if (!sqe) {
+            io_uring_submit(&ring_);
+            sqe = io_uring_get_sqe(&ring_);
+            if (!sqe) die("get_sqe write");
+        }
+
+        IoUser *u = user_pool_.acquire();
+        if (!u) die("IoUser pool exhausted");
+        u->tag = EventTag::WRITE;
+        u->fd = conn->fd;
+        u->conn = conn;
+        u->iov = iov;
+
+        io_uring_prep_writev(sqe, conn->fd, &u->iov, 1, 0);
         io_uring_sqe_set_data(sqe, u);
         io_uring_submit(&ring_);
     }
@@ -1234,12 +1316,15 @@ private:
             }
             case EventTag::READ: {
                 Connection *conn = u->conn;
-                struct iovec *iov_ptr = u->piov;
-                if (!conn) { if (iov_ptr) delete iov_ptr; delete u; break; }
+                if (!conn) {
+                    user_pool_.release(u);
+                    break;
+                }
+
                 if (res > 0) {
                     // consumed res bytes into conn->rx: we must adjust ringbuffer's produce
-                    conn->rx->produce((size_t)res);
-                    g_metrics.rx_bytes += (uint64_t)res;
+                    conn->rx->produce((size_t) res);
+                    g_metrics.rx_bytes += (uint64_t) res;
                     conn->last_active_ms.store(now_ms(), std::memory_order_relaxed);
 
                     // now process available complete packets (reuse on_readable logic)
@@ -1264,7 +1349,8 @@ private:
                         if (conn->rx->readable_bytes() < H + hdr.body_len) break;
 
                         conn->rx->consume(H);
-                        (void)conn->rx->writable_region(std::min<size_t>(LARGE_BLOCK, std::max<size_t>(SMALL_BLOCK, hdr.body_len)));
+                        (void) conn->rx->writable_region(
+                            std::min<size_t>(LARGE_BLOCK, std::max<size_t>(SMALL_BLOCK, hdr.body_len)));
 
                         BufferBlock *stolen = conn->rx->steal_body_after(0, hdr.body_len);
                         if (!stolen) {
@@ -1293,17 +1379,19 @@ private:
                     if (maybe) submit_read_fd(u->fd, maybe, SMALL_BLOCK, EventTag::READ);
                 }
 
-                if (iov_ptr) delete iov_ptr;
                 break;
             }
             case EventTag::WRITE: {
                 Connection *conn = u->conn;
-                struct iovec *piov_ptr = u->piov;
-                if (!conn) { if (piov_ptr) delete piov_ptr; delete u; break; }
+                if (!conn) {
+                    user_pool_.release(u);
+                    break;
+                }
+
                 if (res >= 0) {
-                    g_metrics.tx_bytes += (uint64_t)res;
+                    g_metrics.tx_bytes += (uint64_t) res;
                     g_metrics.tx_pkts.fetch_add(1, std::memory_order_relaxed);
-                    conn->out_advance((size_t)res, pool_);
+                    conn->out_advance((size_t) res, pool_);
                     conn->writing.store(false, std::memory_order_release);
                     if (!conn->out_empty()) {
                         submit_write(conn);
@@ -1315,7 +1403,7 @@ private:
                         close_conn(conn, conns);
                     }
                 }
-                if (piov_ptr) delete piov_ptr;
+
                 break;
             }
             case EventTag::METRICS_READ: {
@@ -1325,7 +1413,7 @@ private:
                 break;
         }
 
-        delete u;
+        user_pool_.release(u);
     }
 
     void process_incoming_tasks_and_submit_writes(std::unordered_map<int, Connection *> &conns) {
@@ -1351,7 +1439,7 @@ private:
     void handle_metrics_conn(int cfd) {
         // simple blocking-ish read (metrics connections are rare). Do minimal handling:
         char buf[1024];
-        int n = (int)recv(cfd, buf, sizeof(buf) - 1, 0);
+        int n = (int) recv(cfd, buf, sizeof(buf) - 1, 0);
         if (n <= 0) return;
         buf[n] = 0;
         if (strncmp(buf, "GET /metrics", 12) == 0) {
@@ -1414,6 +1502,7 @@ private:
     DualBufferPool &pool_;
     ConnectionPool &cpool_;
     WorkerPool &workers_;
+    IoUserPool &user_pool_;
     uint64_t idle_ms_, active_ms_;
     TaskQueue taskq_;
     TimingWheel wheel_;
@@ -1441,16 +1530,16 @@ int main(int argc, char **argv) {
     uint16_t port = 9000;
     uint16_t metrics_port = 9100;
     if (argc > 1)
-        port = (uint16_t)atoi(argv[1]);
+        port = (uint16_t) atoi(argv[1]);
     if (argc > 2)
-        metrics_port = (uint16_t)atoi(argv[2]);
+        metrics_port = (uint16_t) atoi(argv[2]);
 
     init_logger();
 
     int ncpu = get_nprocs();
     ncpu = 2;
-    size_t small_blocks = (size_t)ncpu * 32 * 1000; // 可按内存和连接数调节
-    size_t large_blocks = (size_t)ncpu * 16 * 1000;
+    size_t small_blocks = (size_t) ncpu * 32 * 1000; // 可按内存和连接数调节
+    size_t large_blocks = (size_t) ncpu * 16 * 1000;
 
     LOG_INFO("ET-opt server starting on port %u with %d CPUs, small_blocks=%zu, "
              "large_blocks=%zu",
@@ -1460,6 +1549,7 @@ int main(int argc, char **argv) {
     size_t max_conn = 1000;
     RingBufferPool rpool(max_conn, pool);
     ConnectionPool cpool(max_conn, pool, rpool);
+    IoUserPool io_pool(max_conn * 2);
     size_t worker_threads = std::max(1, ncpu * 1);
     WorkerPool workers(worker_threads);
 
@@ -1471,17 +1561,17 @@ int main(int argc, char **argv) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(listen_fd, (sockaddr *)&addr, sizeof addr) < 0)
+    if (bind(listen_fd, (sockaddr *) &addr, sizeof addr) < 0)
         die("bind");
     if (listen(listen_fd, 65535) < 0)
         die("listen");
 
     // 启动 per-cpu Reactor（共享同一个 listen_fd）
     std::vector<std::thread> reactor_threads;
-    std::vector<std::unique_ptr<Reactor>> reactors;
+    std::vector<std::unique_ptr<Reactor> > reactors;
     for (int i = 0; i < ncpu; ++i) {
-        reactors.emplace_back(new Reactor(i, listen_fd, pool, cpool, workers,
-                                         DEFAULT_IDLE_MS, DEFAULT_ACTIVE_MS));
+        reactors.emplace_back(new Reactor(i, listen_fd, pool, cpool, workers, io_pool,
+                                          DEFAULT_IDLE_MS, DEFAULT_ACTIVE_MS));
         reactors.back()->set_metrics_port(metrics_port);
         reactor_threads.emplace_back([&r = reactors.back()]() { r->run(); });
     }
@@ -1492,7 +1582,7 @@ int main(int argc, char **argv) {
         while (!g_terminate.load()) {
             std::this_thread::sleep_for(std::chrono::seconds(4));
             auto now = steady_clock::now();
-            double s = duration_cast<duration<double>>(now - last).count();
+            double s = duration_cast<duration<double> >(now - last).count();
             last = now;
             uint64_t rx = g_metrics.rx_bytes.load(), tx = g_metrics.tx_bytes.load();
             double rxrate = (rx - last_rx) / s, txrate = (tx - last_tx) / s;
@@ -1506,31 +1596,31 @@ int main(int argc, char **argv) {
             localtime_r(&tv.tv_sec, &tm_info);
 
             logger_->debug(
-                    "acc={} cls={} rx={} tx={} rx/s={:.2f}B "
-                    "tx/s={:.2f}B pkts(rx={} tx={}) drop={} err={} to={} sp={} lp={} rp={} cp={} in={} out={}",
-                    g_metrics.accepted.load(),
-                    g_metrics.closed.load(),
-                    rx, tx, rxrate, txrate,
-                    g_metrics.rx_pkts.load(),
-                    g_metrics.tx_pkts.load(),
-                    g_metrics.drops.load(),
-                    g_metrics.parse_errors.load(),
-                    g_metrics.timeouts.load(),
-                    g_metrics.s_pool.load(),
-                    g_metrics.l_pool.load(),
-                    g_metrics.r_pool.load(),
-                    g_metrics.c_pool.load(),
-                    g_metrics.in_ev.load(),
-                    g_metrics.out_ev.load());
+                "acc={} cls={} rx={} tx={} rx/s={:.2f}B "
+                "tx/s={:.2f}B pkts(rx={} tx={}) drop={} err={} to={} sp={} lp={} rp={} cp={} in={} out={}",
+                g_metrics.accepted.load(),
+                g_metrics.closed.load(),
+                rx, tx, rxrate, txrate,
+                g_metrics.rx_pkts.load(),
+                g_metrics.tx_pkts.load(),
+                g_metrics.drops.load(),
+                g_metrics.parse_errors.load(),
+                g_metrics.timeouts.load(),
+                g_metrics.s_pool.load(),
+                g_metrics.l_pool.load(),
+                g_metrics.r_pool.load(),
+                g_metrics.c_pool.load(),
+                g_metrics.in_ev.load(),
+                g_metrics.out_ev.load());
         }
     });
 
     while (!g_terminate.load())
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     LOG_INFO("shutdown requested, stopping reactors");
-    for (auto &r : reactors)
+    for (auto &r: reactors)
         r->stop();
-    for (auto &t : reactor_threads)
+    for (auto &t: reactor_threads)
         if (t.joinable())
             t.join();
     metrics_printer.join();
