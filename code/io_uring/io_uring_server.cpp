@@ -1,8 +1,6 @@
-// io_uring_server_with_registered_buffers.cpp
-// 基于用户原始 io_uring_server.cpp 的修改版：使用 io_uring_register_buffers + read_fixed
-// 我在 Reactor 内部增加了一个固定缓冲区池（all FIXED_BUF_SIZE sized buffers），
-// 注册到 kernel（io_uring_register_buffers），并在提交读时使用 io_uring_prep_read_fixed。
-// 完成后把数据拷贝回原来的 RingBuffer 逻辑里，然后释放固定缓冲区索引。
+// io_uring_server_multishot_accept.cpp
+// 基于用户原始 io_uring_server.cpp 的修改版：使用 MULTISHOT accept
+// 其余逻辑（registered buffers, read_fixed, ringbuffer, worker）保持不变。
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -1063,9 +1061,11 @@ public:
         }
 
         std::unordered_map<int, Connection *> conns;
-        logger_->debug("run using io_uring (registered buffers)");
+        logger_->debug("run using io_uring (registered buffers) with MULTISHOT accept on listen_fd");
 
+        // 提交 multishot accept (只为主 listen_fd 提交一次)
         submit_accept();
+
         submit_read_fd(tfd_, nullptr, sizeof(uint64_t), EventTag::TIMER);
         if (metrics_fd_ >= 0) {
             submit_accept_fd(metrics_fd_, EventTag::METRICS_LISTEN, nullptr);
@@ -1145,7 +1145,6 @@ private:
         free_head_.store(FIXED_COUNT - 1, std::memory_order_release);
     }
 
-
     int alloc_fixed_index() {
         int head = free_head_.load(std::memory_order_acquire);
         while (head != -1) {
@@ -1159,7 +1158,6 @@ private:
         return -1; // 空
     }
 
-
     void free_fixed_index(int idx) {
         if (idx < 0) return;
         int head = free_head_.load(std::memory_order_relaxed);
@@ -1171,6 +1169,7 @@ private:
     }
 
     void submit_accept() {
+        // 为主 listen_fd 提交 multishot accept（tag = ACCEPT）
         submit_accept_fd(listen_fd_, EventTag::ACCEPT, nullptr);
     }
 
@@ -1187,6 +1186,27 @@ private:
         u->fd = fd;
         u->conn = nullptr;
 
+        // 对主 listen_fd 使用 multishot accept（只当 tag == ACCEPT 且 fd == listen_fd_）
+        if (tag == EventTag::ACCEPT && fd == listen_fd_) {
+            // 使用 multishot accept：内核会用同一个 SQE 连续返回多个 accept 的 CQE
+#ifdef IO_URING_HAVE_MULTISHOT
+            io_uring_prep_multishot_accept(sqe, fd, nullptr, nullptr,
+                                           SOCK_NONBLOCK | SOCK_CLOEXEC);
+#else
+            // 如果 liburing 没有封装 multishot helper，可以直接设置 flags:
+            // 这里假设 liburing 支持 io_uring_prep_multishot_accept；
+            // 若没有，请用 io_uring_prep_accept 并设置 sqe->flags |= IOSQE_ASYNC (或手动构造)
+            io_uring_prep_accept(sqe, fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+            // note: may not be actual multishot without kernel/liburing support
+#endif
+            // 把 IoUser 绑定到 sqe（注意：multishot 的 IoUser 在后续 CQE 中会被复用）
+            io_uring_sqe_set_data(sqe, u);
+            io_uring_submit(&ring_);
+            // 不在这里释放 u（会在 handle_cqe 中根据 IORING_CQE_F_MORE 决定何时释放）
+            return;
+        }
+
+        // 普通 accept（用于 metrics_fd 或其他单次 accept）
         io_uring_prep_accept(sqe, fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
         io_uring_sqe_set_data(sqe, u);
         io_uring_submit(&ring_);
@@ -1306,6 +1326,9 @@ private:
             return;
         }
 
+        // 如果这是 multishot accept 的 IoUser，则后续 CQE 会继续复用同一个 u
+        bool is_multishot_accept = (u->tag == EventTag::ACCEPT && u->fd == listen_fd_);
+
         switch (u->tag) {
         case EventTag::ACCEPT:
         case EventTag::METRICS_LISTEN:
@@ -1318,7 +1341,7 @@ private:
                     handle_metrics_conn(cfd);
                     close(cfd);
                 } else {
-                    // normal accepted connection
+                    // normal accepted connection (either multishot main listen_fd 或 普通 accept)
                     set_tcp_options(cfd);
                     Connection *conn = nullptr;
                     if (!cpool_.admit(cfd, &conn)) {
@@ -1332,8 +1355,27 @@ private:
                         submit_read_fd(cfd, conn, SMALL_BLOCK, EventTag::READ);
                     }
                 }
+            } else {
+                // accept error: 若是 EMFILE / ENOMEM 等可以选择重试
+                logger_->debug("accept error res=%d errno=%d", res, errno);
             }
-            submit_accept();
+
+            // 对 multishot accept：如果 CQE 带 IORING_CQE_F_MORE，说明内核后续会继续直接发出更多 accept CQE（相对高效）
+            // 那种情况下我们不释放 IoUser，也不重新提交 accept。只有当内核发出的 CQE 没有 IORING_CQE_F_MORE 时，表示 multishot 已结束（需要补投）
+            if (is_multishot_accept) {
+                if (!(cqe->flags & IORING_CQE_F_MORE)) {
+                    // multishot 已结束（或者内核决定不再连续返回），需要重新投递一次 accept（以保证继续 accept）
+                    submit_accept();
+                    // 释放旧 IoUser（因为 submit_accept 会获取新的 IoUser）
+                    user_pool_.release(u);
+                } else {
+                    // 还有更多 CQE 将随即到来，保持 u 不释放（内核会继续使用此 user_data）
+                    // do nothing: keep u allocated
+                }
+            } else {
+                // 普通 accept（如 metrics listen）: 已完成一次 accept，释放 IoUser
+                user_pool_.release(u);
+            }
             break;
         }
         case EventTag::TIMER: {
@@ -1342,6 +1384,7 @@ private:
                 wheel_.tick(tnow, [&](int xfd) { on_timeout(xfd, conns); });
             }
             submit_read_fd(tfd_, nullptr, sizeof(uint64_t), EventTag::TIMER);
+            user_pool_.release(u);
             break;
         }
         case EventTag::READ: {
@@ -1461,6 +1504,7 @@ private:
                 if (maybe) submit_read_fd(u->fd, maybe, SMALL_BLOCK, EventTag::READ);
             }
 
+            user_pool_.release(u);
             break;
         }
         case EventTag::WRITE: {
@@ -1486,16 +1530,17 @@ private:
                 }
             }
 
+            user_pool_.release(u);
             break;
         }
         case EventTag::METRICS_READ: {
+            user_pool_.release(u);
             break;
         }
         default:
+            user_pool_.release(u);
             break;
         }
-
-        user_pool_.release(u);
     }
 
     void process_incoming_tasks_and_submit_writes(std::unordered_map<int, Connection *> &conns) {
@@ -1608,7 +1653,6 @@ private:
     int tfd_ = -1;
 };
 
-// -------------------------- 主程序 --------------------------
 static std::atomic<bool> g_terminate{false};
 
 static void signal_handler(int sig) {
