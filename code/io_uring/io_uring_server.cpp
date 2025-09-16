@@ -1,4 +1,9 @@
-// io_uring_server.cpp
+// io_uring_server_with_registered_buffers.cpp
+// 基于用户原始 io_uring_server.cpp 的修改版：使用 io_uring_register_buffers + read_fixed
+// 我在 Reactor 内部增加了一个固定缓冲区池（all FIXED_BUF_SIZE sized buffers），
+// 注册到 kernel（io_uring_register_buffers），并在提交读时使用 io_uring_prep_read_fixed。
+// 完成后把数据拷贝回原来的 RingBuffer 逻辑里，然后释放固定缓冲区索引。
+
 #include <algorithm>
 #include <arpa/inet.h>
 #include <atomic>
@@ -100,8 +105,8 @@ static const uint64_t DEFAULT_ACTIVE_MS = 1 * 60 * 1000;
 // -------------------------- Metrics --------------------------
 struct Metrics {
     std::atomic<uint64_t> accepted{0}, closed{0}, rx_bytes{0}, tx_bytes{0},
-            rx_pkts{0}, tx_pkts{0}, drops{0}, parse_errors{0}, timeouts{0}, s_pool{0}, l_pool{0}, r_pool{0}, c_pool{0},
-            in_ev{0}, out_ev{0};
+        rx_pkts{0}, tx_pkts{0}, drops{0}, parse_errors{0}, timeouts{0}, s_pool{0}, l_pool{0}, r_pool{0}, c_pool{0},
+        in_ev{0}, out_ev{0};
 } g_metrics;
 
 static std::string metrics_text() {
@@ -171,6 +176,8 @@ public:
     BufferPoolBase(size_t block_size, size_t total_blocks) : bs_(block_size) {
         storage_.reserve(total_blocks);
         backing_.reserve(total_blocks * block_size);
+        // allocate backing storage
+        backing_.resize(total_blocks * block_size);
         for (size_t i = 0; i < total_blocks; ++i) {
             storage_.emplace_back(std::make_unique<BufferBlock>());
         }
@@ -658,7 +665,6 @@ public:
         if (out_empty() || !out_buffer)
             return {nullptr, 0};
         return {out_buffer->data, out_len}; // 修复：返回真实长度
-        //return {out_buffer->data, 8};			//测试收发，实际上客户端可能一次性读取返回数据，如果采用了类似et的方式
     }
 
     void out_advance(size_t bytes_written, DualBufferPool &pool) {
@@ -778,7 +784,7 @@ public:
 
     explicit TimingWheel(uint64_t tick_ms, size_t slots)
         : tick_ms_(tick_ms), slots_(normalize_pow2(slots)), slot_mask_(slots_ - 1),
-          initialized_(false), last_slot_index_(0) {
+        initialized_(false), last_slot_index_(0) {
         slots_q_.reserve(slots_);
         for (size_t i = 0; i < slots_; ++i) {
             slots_q_.emplace_back(std::make_unique<MPMCRing<Entry> >(1 << 14));
@@ -788,7 +794,7 @@ public:
     /*
      * 加入时间轮意味着active_ms后进行检查，如果在检查时发现距检查点已经过了idle_ms的时间，
      * 则判定为超时，如果未到idle_ms的时间，那么就在下一个active_ms时再检查，实际上超时的
-	 * 时间是active_ms+idle_ms
+     * 时间是active_ms+idle_ms
     */
     inline void add(int fd, uint64_t expire_ms) {
         //记录检查的时间，放到对应的槽中
@@ -954,8 +960,10 @@ struct IoUser {
     Connection *conn;
     struct iovec iov;
     IoUser *next;
+    // 新增：固定缓冲区索引
+    int buf_index;
 
-    IoUser() : tag(EventTag::READ), fd(-1), conn(nullptr), iov{nullptr, 0}, next(nullptr) {
+    IoUser() : tag(EventTag::READ), fd(-1), conn(nullptr), iov{nullptr, 0}, next(nullptr), buf_index(-1) {
     }
 };
 
@@ -990,6 +998,7 @@ public:
         if (!u) return;
         u->conn = nullptr;
         u->iov = {nullptr, 0};
+        u->buf_index = -1;
         IoUser *head = freelist_.load(std::memory_order_relaxed);
         do {
             u->next = head;
@@ -1009,11 +1018,10 @@ public:
             ConnectionPool &cpool, WorkerPool &workers, IoUserPool &io_pool, uint64_t idle_ms,
             uint64_t active_ms)
         : cpu_id_(cpu_id), listen_fd_(listen_fd), pool_(pool), cpool_(cpool),
-          workers_(workers), user_pool_(io_pool), idle_ms_(idle_ms), active_ms_(active_ms), taskq_(),
-          wheel_(100, 1024) {
-        struct io_uring_params params;
-        memset(&params, 0, sizeof(params));
-        io_uring_queue_init_params(128, &ring_, &params);
+        workers_(workers), user_pool_(io_pool), idle_ms_(idle_ms), active_ms_(active_ms), taskq_(),
+        wheel_(100, 1024) {
+        // 在构造里仅初始化 ring 结构体为默认（真正 init 在 run 里以 err handling），
+        memset(&ring_, 0, sizeof(ring_));
     }
 
     ~Reactor() {
@@ -1027,6 +1035,9 @@ public:
         if (io_uring_queue_init_params(4096, &ring_, &params) < 0) {
             die("io_uring_queue_init_params");
         }
+
+        // 初始化并注册固定缓冲区池（registered buffers）
+        init_registered_buffers();
 
         tfd_ = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
         if (tfd_ < 0) die("timerfd_create");
@@ -1052,7 +1063,7 @@ public:
         }
 
         std::unordered_map<int, Connection *> conns;
-        logger_->debug("run using io_uring");
+        logger_->debug("run using io_uring (registered buffers)");
 
         submit_accept();
         submit_read_fd(tfd_, nullptr, sizeof(uint64_t), EventTag::TIMER);
@@ -1089,6 +1100,14 @@ public:
         }
         if (metrics_fd_ >= 0) close(metrics_fd_);
         close(tfd_);
+
+        // 注销注册缓冲区
+        if (!registered_iov_.empty()) {
+            io_uring_unregister_buffers(&ring_);
+            registered_iov_.clear();
+            registered_backing_.clear();
+        }
+
         io_uring_queue_exit(&ring_);
         logger_->debug("exit");
     }
@@ -1098,6 +1117,59 @@ public:
     bool enqueue_response(const ResponseTask &t) { return taskq_.enqueue(t); }
 
 private:
+    void init_registered_buffers() {
+        const int FIXED_COUNT = 2048;
+        const size_t FIXED_BUF_SIZE = LARGE_BLOCK;
+
+        registered_backing_.resize((size_t)FIXED_COUNT * FIXED_BUF_SIZE);
+        registered_iov_.resize(FIXED_COUNT);
+        for (int i = 0; i < FIXED_COUNT; ++i) {
+            registered_iov_[i].iov_base = &registered_backing_[(size_t)i * FIXED_BUF_SIZE];
+            registered_iov_[i].iov_len = FIXED_BUF_SIZE;
+        }
+
+
+        int ret = io_uring_register_buffers(&ring_, registered_iov_.data(), FIXED_COUNT);
+        if (ret < 0) {
+            LOG_ERROR("io_uring_register_buffers failed: %d", ret);
+            die("io_uring_register_buffers");
+        }
+
+
+        // 初始化 lock-free 栈：使用单链表 + 原子 head
+        free_head_.store(-1, std::memory_order_relaxed);
+        nodes_ = std::make_unique<Node[]>(FIXED_COUNT);
+        for (int i = 0; i < FIXED_COUNT; ++i) {
+            nodes_[i].next.store(i - 1, std::memory_order_relaxed);
+        }
+        free_head_.store(FIXED_COUNT - 1, std::memory_order_release);
+    }
+
+
+    int alloc_fixed_index() {
+        int head = free_head_.load(std::memory_order_acquire);
+        while (head != -1) {
+            int next = nodes_[head].next.load(std::memory_order_relaxed);
+            if (free_head_.compare_exchange_weak(head, next,
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_acquire)) {
+                return head;
+            }
+        }
+        return -1; // 空
+    }
+
+
+    void free_fixed_index(int idx) {
+        if (idx < 0) return;
+        int head = free_head_.load(std::memory_order_relaxed);
+        do {
+            nodes_[idx].next.store(head, std::memory_order_relaxed);
+        } while (!free_head_.compare_exchange_weak(head, idx,
+                                                   std::memory_order_release,
+                                                   std::memory_order_relaxed));
+    }
+
     void submit_accept() {
         submit_accept_fd(listen_fd_, EventTag::ACCEPT, nullptr);
     }
@@ -1142,23 +1214,54 @@ private:
             return;
         }
 
-        iovec w = conn->rx->writable_region(SMALL_BLOCK);
-        if (w.iov_len == 0) return;
+        // 对于普通连接的读，使用 registered buffers + read_fixed
+        int idx = alloc_fixed_index();
+        if (idx < 0) {
+            // 如果没有可用固定缓冲，则退回到原来的 readv（不理想，但安全）
+            iovec w = conn->rx->writable_region(SMALL_BLOCK);
+            if (w.iov_len == 0) return;
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
+            if (!sqe) {
+                io_uring_submit(&ring_);
+                sqe = io_uring_get_sqe(&ring_);
+                if (!sqe) die("get_sqe readv");
+            }
+
+            IoUser *u = user_pool_.acquire();
+            if (!u) die("IoUser pool exhausted");
+            u->tag = EventTag::READ;
+            u->fd = conn->fd;
+            u->conn = conn;
+            u->iov = w;
+
+            io_uring_prep_readv(sqe, conn->fd, &u->iov, 1, 0);
+            io_uring_sqe_set_data(sqe, u);
+            io_uring_submit(&ring_);
+            return;
+        }
+
+        // 使用 fixed buffer
         struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
         if (!sqe) {
             io_uring_submit(&ring_);
             sqe = io_uring_get_sqe(&ring_);
-            if (!sqe) die("get_sqe readv");
+            if (!sqe) die("get_sqe read_fixed");
         }
 
         IoUser *u = user_pool_.acquire();
-        if (!u) die("IoUser pool exhausted");
+        if (!u) {
+            free_fixed_index(idx);
+            die("IoUser pool exhausted");
+        }
         u->tag = EventTag::READ;
         u->fd = conn->fd;
         u->conn = conn;
-        u->iov = w;
+        u->buf_index = idx;
+        u->iov.iov_base = registered_iov_[idx].iov_base; // 实际数据指针
+        u->iov.iov_len = registered_iov_[idx].iov_len;
 
-        io_uring_prep_readv(sqe, conn->fd, &u->iov, 1, 0);
+        // 使用 read_fixed：最后一个参数是 buf_index
+        io_uring_prep_read_fixed(sqe, conn->fd, u->iov.iov_base, u->iov.iov_len, 0, idx);
         io_uring_sqe_set_data(sqe, u);
         io_uring_submit(&ring_);
     }
@@ -1204,63 +1307,75 @@ private:
         }
 
         switch (u->tag) {
-            case EventTag::ACCEPT:
-            case EventTag::METRICS_LISTEN:
-            case EventTag::METRICS_ACCEPT: {
-                // accept returned new fd (or error)
-                int cfd = res;
-                if (cfd >= 0) {
-                    if (u->tag == EventTag::METRICS_LISTEN) {
-                        // metrics connection accepted; handle in place
-                        handle_metrics_conn(cfd);
-                        close(cfd);
-                    } else {
-                        // normal accepted connection
-                        set_tcp_options(cfd);
-                        Connection *conn = nullptr;
-                        if (!cpool_.admit(cfd, &conn)) {
-                            g_metrics.closed.fetch_add(1, std::memory_order_relaxed);
-                            ::close(cfd);
-                        } else {
-                            conns[cfd] = conn;
-                            g_metrics.accepted.fetch_add(1, std::memory_order_relaxed);
-                            wheel_.add(cfd, now_ms() + active_ms_);
-                            // immediately submit a read for this conn
-                            submit_read_fd(cfd, conn, SMALL_BLOCK, EventTag::READ);
-                        }
-                    }
+        case EventTag::ACCEPT:
+        case EventTag::METRICS_LISTEN:
+        case EventTag::METRICS_ACCEPT: {
+            // accept returned new fd (or error)
+            int cfd = res;
+            if (cfd >= 0) {
+                if (u->tag == EventTag::METRICS_LISTEN) {
+                    // metrics connection accepted; handle in place
+                    handle_metrics_conn(cfd);
+                    close(cfd);
                 } else {
-                    // accept error - if transient, ignore. We will resubmit an accept anyway.
+                    // normal accepted connection
+                    set_tcp_options(cfd);
+                    Connection *conn = nullptr;
+                    if (!cpool_.admit(cfd, &conn)) {
+                        g_metrics.closed.fetch_add(1, std::memory_order_relaxed);
+                        ::close(cfd);
+                    } else {
+                        conns[cfd] = conn;
+                        g_metrics.accepted.fetch_add(1, std::memory_order_relaxed);
+                        wheel_.add(cfd, now_ms() + active_ms_);
+                        // immediately submit a read for this conn
+                        submit_read_fd(cfd, conn, SMALL_BLOCK, EventTag::READ);
+                    }
                 }
-                // resubmit accept on listen_fd (always keep accepting)
-                submit_accept();
+            }
+            submit_accept();
+            break;
+        }
+        case EventTag::TIMER: {
+            if (res >= 0) {
+                uint64_t tnow = now_ms();
+                wheel_.tick(tnow, [&](int xfd) { on_timeout(xfd, conns); });
+            }
+            submit_read_fd(tfd_, nullptr, sizeof(uint64_t), EventTag::TIMER);
+            break;
+        }
+        case EventTag::READ: {
+            Connection *conn = u->conn;
+            if (!conn) {
+                // 如果使用 fixed buffer，释放 index
+                if (u->buf_index >= 0) free_fixed_index(u->buf_index);
+                user_pool_.release(u);
                 break;
             }
-            case EventTag::TIMER: {
-                // timerfd read completed; resubmit read to keep getting ticks
-                if (res >= 0) {
-                    uint64_t tnow = now_ms();
-                    wheel_.tick(tnow, [&](int xfd) { on_timeout(xfd, conns); });
-                }
-                // resubmit timer read
-                submit_read_fd(tfd_, nullptr, sizeof(uint64_t), EventTag::TIMER);
-                break;
-            }
-            case EventTag::READ: {
-                Connection *conn = u->conn;
-                if (!conn) {
-                    user_pool_.release(u);
-                    break;
-                }
 
-                if (res > 0) {
-                    // consumed res bytes into conn->rx: we must adjust ringbuffer's produce
-                    conn->rx->produce((size_t) res);
+            if (res > 0) {
+                // 如果该 IO 来自固定 buffer（read_fixed），需要把数据拷贝回 conn->rx
+                if (u->buf_index >= 0) {
+                    // 拷贝到 ringbuffer 的 writable_region（可能需要循环拷贝）
+                    size_t remaining = (size_t) res;
+                    size_t copied = 0;
+                    while (remaining > 0) {
+                        iovec w = conn->rx->writable_region(LARGE_BLOCK);
+                        if (w.iov_len == 0) break;
+                        size_t take = std::min(remaining, w.iov_len);
+                        memcpy((uint8_t *) w.iov_base, (uint8_t *) u->iov.iov_base + copied, take);
+                        conn->rx->produce(take);
+                        remaining -= take;
+                        copied += take;
+                    }
                     g_metrics.rx_bytes += (uint64_t) res;
                     conn->last_active_ms.store(now_ms(), std::memory_order_relaxed);
 
-                    // now process available complete packets (reuse on_readable logic)
-                    // copy-paste of on_readable's packet parsing loop but limited to current thread
+                    // 释放 fixed buffer 回池
+                    free_fixed_index(u->buf_index);
+                    u->buf_index = -1;
+
+                    // 现在处理包（与原来逻辑类似）
                     const size_t H = 1 + 4;
                     while (true) {
                         if (conn->rx->readable_bytes() < H) break;
@@ -1293,56 +1408,91 @@ private:
 
                         business_worker_echo(conn->fd, stolen, hdr.body_len, taskq_);
                     }
-                } else if (res == 0) {
-                    // peer closed
+                } else {
+                    // fallback: 使用 readv path（原逻辑）
+                    conn->rx->produce((size_t) res);
+                    g_metrics.rx_bytes += (uint64_t) res;
+                    conn->last_active_ms.store(now_ms(), std::memory_order_relaxed);
+
+                    const size_t H = 1 + 4;
+                    while (true) {
+                        if (conn->rx->readable_bytes() < H) break;
+                        uint8_t hdrbuf[5];
+                        size_t got = conn->rx->peek_bytes(hdrbuf, H);
+                        if (got < H) break;
+                        PacketHeader hdr;
+                        hdr.body_offset = hdrbuf[0];
+                        uint32_t bl;
+                        memcpy(&bl, hdrbuf + 1, 4);
+                        hdr.body_len = bl;
+                        const uint32_t MAX_BODY = 16 * 1024 * 1024;
+                        if (hdr.body_len > MAX_BODY) {
+                            g_metrics.parse_errors.fetch_add(1, std::memory_order_relaxed);
+                            close_conn(conn, conns);
+                            break;
+                        }
+                        if (conn->rx->readable_bytes() < H + hdr.body_len) break;
+
+                        conn->rx->consume(H);
+                        (void) conn->rx->writable_region(
+                            std::min<size_t>(LARGE_BLOCK, std::max<size_t>(SMALL_BLOCK, hdr.body_len)));
+
+                        BufferBlock *stolen = conn->rx->steal_body_after(0, hdr.body_len);
+                        if (!stolen) {
+                            g_metrics.drops.fetch_add(1, std::memory_order_relaxed);
+                            break;
+                        }
+                        g_metrics.rx_pkts.fetch_add(1, std::memory_order_relaxed);
+
+                        business_worker_echo(conn->fd, stolen, hdr.body_len, taskq_);
+                    }
+                }
+            } else if (res == 0) {
+                close_conn(conn, conns);
+            } else {
+                if (res == -EAGAIN || res == -EWOULDBLOCK) {
+                } else {
                     close_conn(conn, conns);
+                }
+            }
+
+            if (conns.find(u->fd) != conns.end()) {
+                Connection *maybe = conns[u->fd];
+                if (maybe) submit_read_fd(u->fd, maybe, SMALL_BLOCK, EventTag::READ);
+            }
+
+            break;
+        }
+        case EventTag::WRITE: {
+            Connection *conn = u->conn;
+            if (!conn) {
+                user_pool_.release(u);
+                break;
+            }
+
+            if (res >= 0) {
+                g_metrics.tx_bytes += (uint64_t) res;
+                g_metrics.tx_pkts.fetch_add(1, std::memory_order_relaxed);
+                conn->out_advance((size_t) res, pool_);
+                conn->writing.store(false, std::memory_order_release);
+                if (!conn->out_empty()) {
+                    submit_write(conn);
+                }
+            } else {
+                conn->writing.store(false, std::memory_order_release);
+                if (res == -EAGAIN || res == -EWOULDBLOCK) {
                 } else {
-                    if (res == -EAGAIN || res == -EWOULDBLOCK) {
-                        // nothing to read now
-                    } else {
-                        close_conn(conn, conns);
-                    }
+                    close_conn(conn, conns);
                 }
-
-                // resubmit a read for the connection if still present
-                if (conns.find(u->fd) != conns.end()) {
-                    // safe to resubmit read
-                    Connection *maybe = conns[u->fd];
-                    if (maybe) submit_read_fd(u->fd, maybe, SMALL_BLOCK, EventTag::READ);
-                }
-
-                break;
             }
-            case EventTag::WRITE: {
-                Connection *conn = u->conn;
-                if (!conn) {
-                    user_pool_.release(u);
-                    break;
-                }
 
-                if (res >= 0) {
-                    g_metrics.tx_bytes += (uint64_t) res;
-                    g_metrics.tx_pkts.fetch_add(1, std::memory_order_relaxed);
-                    conn->out_advance((size_t) res, pool_);
-                    conn->writing.store(false, std::memory_order_release);
-                    if (!conn->out_empty()) {
-                        submit_write(conn);
-                    }
-                } else {
-                    conn->writing.store(false, std::memory_order_release);
-                    if (res == -EAGAIN || res == -EWOULDBLOCK) {
-                    } else {
-                        close_conn(conn, conns);
-                    }
-                }
-
-                break;
-            }
-            case EventTag::METRICS_READ: {
-                break;
-            }
-            default:
-                break;
+            break;
+        }
+        case EventTag::METRICS_READ: {
+            break;
+        }
+        default:
+            break;
         }
 
         user_pool_.release(u);
@@ -1369,7 +1519,6 @@ private:
     }
 
     void handle_metrics_conn(int cfd) {
-        // simple blocking-ish read (metrics connections are rare). Do minimal handling:
         char buf[1024];
         int n = (int) recv(cfd, buf, sizeof(buf) - 1, 0);
         if (n <= 0) return;
@@ -1398,7 +1547,6 @@ private:
             conn->out_buffer = nullptr;
         }
         int fd = conn->fd;
-        // remove from map if present
         auto it = conns.find(fd);
         if (it != conns.end()) conns.erase(it);
         cpool_.release_ref(conn);
@@ -1428,6 +1576,11 @@ private:
 #endif
     }
 
+private:
+    struct Node {
+        std::atomic<int> next;
+    };
+
     // members
     int cpu_id_;
     int listen_fd_;
@@ -1442,7 +1595,15 @@ private:
     int metrics_fd_ = -1;
     int metrics_port_ = 9100;
 
-    // io_uring
+
+    std::vector<char> registered_backing_;
+    std::vector<iovec> registered_iov_;
+
+
+    // lock-free 栈
+    std::atomic<int> free_head_;
+    std::unique_ptr<Node[]> nodes_;
+
     struct io_uring ring_;
     int tfd_ = -1;
 };
@@ -1523,7 +1684,6 @@ int main(int argc, char **argv) {
             struct timeval tv;
             gettimeofday(&tv, NULL);
 
-            // 转换为本地时间
             struct tm tm_info;
             localtime_r(&tv.tv_sec, &tm_info);
 
