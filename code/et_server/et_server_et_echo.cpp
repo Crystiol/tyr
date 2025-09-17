@@ -1,6 +1,6 @@
-// et_server_et_echo_fixed.cpp
-// 基于原 et_server_et_echo.cpp 的修复版本：避免重复发送（out buffer 使用 read/write 指针）
-// 编译：g++ -std=c++11 -O2 et_server_et_echo_fixed.cpp -lpthread -o server
+// et_server_et_echo_diag.cpp
+// 基于原 et_server_et_echo_fixed.cpp 的诊断版本：在 consume/steal/parse 等关键处加入校验与日志，便于定位 unexpect 4 的原因
+// 编译：g++ -std=c++11 -O2 et_server_et_echo_diag.cpp -lpthread -o server
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -54,7 +54,7 @@ void init_logger() {
     console_sink->set_level(spdlog::level::debug);
     console_sink->set_pattern("[et_server] [%^%l%$] %v");
 
-    auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>("et_log.txt", true);
+    auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>("et_log_diag.txt", true);
     file_sink->set_level(spdlog::level::trace);
 
     logger_ = std::make_shared<spdlog::logger>("multi_sink", spdlog::sinks_init_list{console_sink, file_sink});
@@ -486,23 +486,41 @@ public:
 
     // 消耗 n 字节（推进读指针并释放完整块）
     void consume(size_t n) {
+        // 诊断前后的可读字节数，便于断言
+        size_t before = readable_bytes();
         size_t remain = n;
         while (remain > 0 && head_) {
             size_t avail = (head_ == tail_) ? (tail_off_ - head_off_) : (head_->cap - head_off_);
             if (avail > remain) {
                 head_off_ += remain;
-                return;
+                remain = 0;
+                break;
             }
+            // avail <= remain 时，移除当前块
             remain -= avail;
             BufferBlock *old = head_;
-            head_ = old->next;          //head指向下一块
-            pool_.release_ref(old);     //回收已读完的块
-            head_off_ = 0;              //下一块的起始地址必定为0，因为还没有被cosume
+            head_ = old->next;          // head 指向下一块
+            pool_.release_ref(old);     // 回收已读完的块
+            head_off_ = 0;              // 下一块的起始地址为 0
             if (!head_) {
                 tail_ = nullptr;
                 tail_off_ = 0;
                 break;
             }
+        }
+        size_t after = readable_bytes();
+        if (before >= n) {
+            size_t expect = before - n;
+            if (after != expect) {
+                logger_->debug("consume mismatch: before={} consume={} after={} (head_off={}, tail_off={})",
+                               before, n, after, head_off_, tail_off_);
+                // 不中断运行，打印堆栈级别的诊断（如果需要可 assert）
+                // assert(after == expect);
+            }
+        } else {
+            // 试图 consume 超过可读数据，这本身就是错误
+            logger_->debug("consume overrun: before={} requested={}", before, n);
+            // assert(false);
         }
     }
 
@@ -529,7 +547,8 @@ public:
 
     // 返回单一 BufferBlock，拷贝数据，按 body_len 选择小/大块
     BufferBlock *steal_body_after(size_t header_len, size_t body_len) {
-        if (readable_bytes() < header_len + body_len)
+        size_t before = readable_bytes();
+        if (before < header_len + body_len)
             return nullptr;
 
         // 决定块大小
@@ -548,29 +567,59 @@ public:
                 off += skip;
                 skip = 0;
                 break;
-            }
-            skip -= avail;
-            cur = cur->next;
-            off = 0;
-        }
-
-        // 拷贝 body_len 到 new_block->data
-        size_t remain = body_len;
-        size_t copied = 0;
-        while (remain > 0 && cur) {
-            size_t avail = (cur == tail_) ? (tail_off_ - off) : (cur->cap - off);
-            size_t take = std::min(avail, remain);
-            memcpy(new_block->data + copied, cur->data + off, take);
-            copied += take;
-            remain -= take;
-            off += take;
-            if (off >= cur->cap) {
+            } else if (avail == skip) {
+                // 恰好耗尽当前块，下一步从下一块开始拷贝
+                skip = 0;
+                cur = cur->next;
+                off = 0;
+                break;
+            } else {
+                skip -= avail;
                 cur = cur->next;
                 off = 0;
             }
         }
 
+        // 拷贝 body_len 到 new_block->data
+        size_t remain = body_len;
+        size_t copied = 0;
+        BufferBlock *copy_src = cur;
+        size_t copy_off = off;
+        while (remain > 0 && copy_src) {
+            size_t avail = (copy_src == tail_) ? (tail_off_ - copy_off) : (copy_src->cap - copy_off);
+            if (avail == 0) {
+                // 不应该出现
+                logger_->debug("steal_body_after: zero avail while copying (remain={}, copied={}, tail_off={}, head_off={})", remain, copied, tail_off_, head_off_);
+                break;
+            }
+            size_t take = std::min(avail, remain);
+            memcpy(new_block->data + copied, copy_src->data + copy_off, take);
+            copied += take;
+            remain -= take;
+            copy_off += take;
+            if (copy_off >= copy_src->cap) {
+                copy_src = copy_src->next;
+                copy_off = 0;
+            }
+        }
+
+        if (copied != body_len) {
+            // 拷贝不完整：释放 new_block 并返回 nullptr
+            logger_->debug("steal_body_after copy incomplete: want={} got={} readable_before={}", body_len, copied, before);
+            pool_.release_ref(new_block);
+            return nullptr;
+        }
+
+        // 消耗 header_len + body_len
         consume(header_len + body_len);
+
+        size_t after = readable_bytes();
+        if (before - (header_len + body_len) != after) {
+            logger_->debug("steal_body_after: readable mismatch before={} after={} consumed={}", before, after, header_len + body_len);
+            // 进一步打印上下文
+            // assert(before - (header_len + body_len) == after);
+        }
+
         return new_block;
     }
 
@@ -1006,7 +1055,7 @@ public:
             die("epoll_create1");
 
         // 监听 fd 必须非阻塞且 EPOLLET
-        epoll_event ev{};
+        epoll_event ev{}; 
         ev.events = EPOLLIN | EPOLLET;
         ev.data.fd = listen_fd_;
         if (epoll_ctl(epfd_, EPOLL_CTL_ADD, listen_fd_, &ev) < 0)
@@ -1054,13 +1103,10 @@ public:
         while (!global_stop_.load()) {
             // 先处理 worker 发回的响应，减少尾延迟
             auto start_time = std::chrono::system_clock::now();
-            //logger_->debug("loop_start");
 
             process_incoming_tasks(conns);
 
-            //logger_->debug("epoll_wait start");
             int n = epoll_wait(epfd_, evs.data(), (int)evs.size(), 100);
-            //logger_->debug("epoll_wait end");
             if (n < 0) {
                 if (errno == EINTR)
                     continue;
@@ -1074,17 +1120,12 @@ public:
                 if (fd == listen_fd_) {
                     logger_->debug("accept_loop start");
                     accept_loop(conns);
-                    //logger_->debug("accept_loop end");
                 } else if (fd == tfd) {
-                    //logger_->debug("timer start");
                     uint64_t exp;
                     (void)read(tfd, &exp, sizeof(exp));
                     wheel_.tick(tnow, [&](int xfd) { on_timeout(xfd, conns); });
-                    //logger_->debug("timer end");
                 } else if (fd == metrics_fd_) {
-                    //logger_->debug("serve_metrics start");
                     serve_metrics(fd);
-                    //logger_->debug("serve_metrics end");
                 } else {
                     auto it = conns.find(fd);
                     if (it == conns.end())
@@ -1108,7 +1149,6 @@ public:
 
             auto end_time = std::chrono::system_clock::now();
             uint64_t elapse = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-            //logger_->debug("loop_end: {}", elapse);
         }
 
         logger_->debug("clean");
@@ -1242,7 +1282,9 @@ private:
             const uint32_t MAX_BODY = 16 * 1024 * 1024;
             if (hdr.body_len > MAX_BODY) {
                 g_metrics.parse_errors.fetch_add(1, std::memory_order_relaxed);
-                logger_->debug("unexpect 4");
+                // 打印原始 header 和当前可读字节，用于诊断是否错位
+                logger_->debug("unexpect 4: raw header bytes = {:02x} {:02x} {:02x} {:02x} {:02x}, parsed_body_len={}, readable={}",
+                               hdrbuf[0], hdrbuf[1], hdrbuf[2], hdrbuf[3], hdrbuf[4], hdr.body_len, conn->rx->readable_bytes());
                 close_conn(conn, conns);
                 return;
             }
@@ -1252,7 +1294,12 @@ private:
             }
 
             // consume header
+            size_t before_consume = conn->rx->readable_bytes();
             conn->rx->consume(H);
+            size_t after_consume = conn->rx->readable_bytes();
+            if (before_consume - H != after_consume) {
+                logger_->debug("consume header mismatch: before={} after={} H={}", before_consume, after_consume, H);
+            }
 
             // 读包体阶段提示使用大块以提升吞吐，并不一定能实现使用大块读
             (void)conn->rx->writable_region(std::min<size_t>(
@@ -1262,6 +1309,7 @@ private:
             BufferBlock *stolen = conn->rx->steal_body_after(0, hdr.body_len);
             if (!stolen) {
                 g_metrics.drops.fetch_add(1, std::memory_order_relaxed);
+                logger_->debug("steal failed for fd={} want_len={} readable={}", conn->fd, hdr.body_len, conn->rx->readable_bytes());
                 break;
             }
             g_metrics.rx_pkts.fetch_add(1, std::memory_order_relaxed);
@@ -1285,8 +1333,6 @@ private:
 
         if(!mod_event(epfd_, conn->fd, events))
             assert(0);
-
-        //logger_->debug("on_readable end");
     }
 
     // [ET-CRITICAL] write 必须写到 EAGAIN 或队列空
@@ -1320,9 +1366,6 @@ private:
                 return;
             }
         }
-
-
-        //logger_->debug("on_writable end");
     }
 
     void on_timeout(int fd, std::unordered_map<int, Connection *> &conns) {
@@ -1341,8 +1384,6 @@ private:
     }
 
     void process_incoming_tasks(std::unordered_map<int, Connection *> &conns) {
-        //logger_->debug("process_incoming_tasks start");
-
         ResponseTask t;
         bool ret = false;
         while (ret = taskq_.dequeue(t)) {
@@ -1365,7 +1406,6 @@ private:
 
             if (!conn->out_empty()){
                 uint32_t events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
-                //g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
                 g_metrics.out_ev.fetch_add(1, std::memory_order_relaxed);
 
                 if(!mod_event(epfd_, conn->fd, events))
@@ -1375,8 +1415,6 @@ private:
             // 业务的 stolen block 在上面已经拷贝到 out_buffer，可以释放
             pool_.release_ref(t.entry.blk);
         }
-
-        //logger_->debug("process_incoming_tasks end {}", ret);
     }
 
     void serve_metrics(int mfd) {
