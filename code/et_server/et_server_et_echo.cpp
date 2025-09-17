@@ -1,10 +1,6 @@
-// epoll_server_prod_zero_copy_et_opt.cpp
-// 单文件高性能零拷贝 Epoll 服务器（全 ET / 批量 accept / 双层 BufferPool）
-// - 完整实现：BufferPool / RingBuffer / Connection / Reactor / WorkerPool / TimingWheel / metrics
-// - 关键位置已标注 [ET-CRITICAL]
-// - 修正：保留 business_worker_echo 原始签名，添加 ConnectionPool 和 RingBufferPool 对象池，
-//         将 Connection::out_ring 从 std::vector<OutEntry> 改为单一 BufferBlock*，优化大包并减少碎片
-// 编译：g++ -std=c++11 -O2 epoll_server_prod_zero_copy_et_opt.cpp -lpthread -o server
+// et_server_et_echo_fixed.cpp
+// 基于原 et_server_et_echo.cpp 的修复版本：避免重复发送（out buffer 使用 read/write 指针）
+// 编译：g++ -std=c++11 -O2 et_server_et_echo_fixed.cpp -lpthread -o server
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -244,7 +240,7 @@ class BufferPoolBase {
 public:
     BufferPoolBase(size_t block_size, size_t total_blocks) : bs_(block_size) {
         storage_.reserve(total_blocks);
-        backing_.reserve(total_blocks * block_size);
+        backing_.resize(total_blocks * block_size);
         for (size_t i = 0; i < total_blocks; ++i){
             storage_.emplace_back(std::make_unique<BufferBlock>());
         }
@@ -416,20 +412,13 @@ template<typename T>
 using WorkQueue = WorkQueueWrapper<T>;
 
 // -------------------------- 协议头（示例） --------------------------
-// #pragma pack(push, 1)
-// struct PacketHeader {
-//     uint8_t magic;
-//     uint32_t body_len;
-//     uint8_t endian;
-//     uint32_t hdr_crc;
-// };
-//#pragma pack(pop)
 #pragma pack(push, 1)
 struct PacketHeader {
     uint8_t body_offset;
     uint32_t body_len;
 };
 #pragma pack(pop)
+
 // -------------------------- RingBuffer（零拷贝入站，支持双层块） --------------------------
 class RingBuffer {
 public:
@@ -684,8 +673,8 @@ public:
     int fd = -1;
     RingBuffer *rx = nullptr;
     BufferBlock *out_buffer = nullptr; // 替换 out_ring 为单一 BufferBlock
-    size_t out_offset = 0; // 当前写入偏移
-    size_t out_len = 0; // 当前有效数据长度
+    size_t write_pos = 0; // 写入位置（下一个写入索引）
+    size_t read_pos = 0;  // 已发送位置（下一个要发送的索引）
     std::atomic<uint64_t> last_active_ms{0};
 
     Connection() {}
@@ -699,10 +688,11 @@ public:
             p.release_ref(out_buffer);
             out_buffer = nullptr;
         }
-        out_offset = out_len = 0;
+        write_pos = read_pos = 0;
         last_active_ms = 0;
     }
 
+    // 写入待发送数据（从 worker 投递过来）
     bool out_push(const OutEntry &e, DualBufferPool &pool) {
         if (!out_buffer) {
             out_buffer = pool.acquire(LARGE_BLOCK);     //分配发送缓冲区
@@ -710,40 +700,38 @@ public:
                 assert(0);
                 return false;
             }
+            write_pos = read_pos = 0;
         }
-        if (out_offset + e.len > out_buffer->cap){
+        // used = write_pos - read_pos
+        size_t used = write_pos - read_pos;
+        if (used + e.len > out_buffer->cap){
             assert(0);
             return false; // 缓冲区不足
         }
-        memcpy(out_buffer->data + out_offset, e.blk->data + e.offset, e.len);
-        out_offset += e.len;
-        out_len += e.len;
-        pool.retain(out_buffer);    //add发送缓冲区计数，可以避免再次分配
+        memcpy(out_buffer->data + write_pos, e.blk->data + e.offset, e.len);
+        write_pos += e.len;
         return true;
     }
 
-    bool out_empty() const { return out_len == 0; }
+    bool out_empty() const { return write_pos == read_pos; }
 
     iovec out_peek() {
         if (out_empty() || !out_buffer)
             return {nullptr, 0};
-        //return {out_buffer->data, out_len};
-        return {out_buffer->data, 8};			//测试收发，实际上客户端可能一次性读取返回数据，如果采用了类似et的方式
+        return {out_buffer->data + read_pos, write_pos - read_pos};
     }
 
     void out_advance(size_t bytes_written, DualBufferPool &pool) {
-        if (bytes_written >= out_len) {
-            out_len = 0;
-            out_offset = 0;
+        read_pos += bytes_written;
+        if (read_pos >= write_pos) {
+            // 全部发送完毕，释放缓冲
+            read_pos = write_pos = 0;
             if (out_buffer) {
-                pool.release_ref(out_buffer);            //回收发送缓冲区
-                //out_buffer = nullptr;       //如果out_push中调用了pool.retain(out_buffer)，则不应该赋空
+                pool.release_ref(out_buffer);
+                out_buffer = nullptr;
             }
-        } else {
-            out_len -= bytes_written;
-            memmove(out_buffer->data, out_buffer->data + bytes_written, out_len);
-            out_offset = out_len;
         }
+        // 注意：不使用 memmove；保持 read_pos/write_pos 语义
     }
 };
 
@@ -848,7 +836,7 @@ public:
 
     explicit TimingWheel(uint64_t tick_ms, size_t slots)
         : tick_ms_(tick_ms), slots_(normalize_pow2(slots)), slot_mask_(slots_ - 1),
-        initialized_(false), last_slot_index_(0) {
+          initialized_(false), last_slot_index_(0) {
         slots_q_.reserve(slots_);
         for (size_t i = 0; i < slots_; ++i){
             slots_q_.emplace_back(std::make_unique<MPMCRing<Entry>>(1 << 14));
@@ -873,57 +861,23 @@ public:
 
     template<typename F>
     void tick(uint64_t now_ms, F on_timeout) {		//开始检查
-        //fprintf(stderr,"tick1\n");
         if (!initialized_.load(std::memory_order_acquire)) {
             size_t idx = (now_ms / tick_ms_) & slot_mask_;
             last_slot_index_.store(idx, std::memory_order_release);
             initialized_.store(true, std::memory_order_release);
             return;
         }
-        //fprintf(stderr,"tick2\n");
         size_t target = (now_ms / tick_ms_) & slot_mask_;
         size_t cur = last_slot_index_.load(std::memory_order_relaxed);
-        //fprintf(stderr,"tick2.1\n");
         while (cur != target) {
             drain(cur, now_ms, on_timeout);
             cur = (cur + 1) & slot_mask_;
         }
-        //fprintf(stderr,"tick3\n");
         last_slot_index_.store(cur, std::memory_order_relaxed);
         drain_light(cur, now_ms, on_timeout);
-        //fprintf(stderr,"tick4\n");
     }
 
 private:
-    /*template<typename F>
-    void drain(size_t idx, uint64_t now_ms, F &on_timeout) {
-        Entry e;
-        while (slots_q_[idx]->dequeue(e)) {
-            if (e.expire_ms <= now_ms)
-                on_timeout(e.fd);
-            else
-                add(e.fd, e.expire_ms);
-        }
-    }*/
-
-    // template<typename F>
-    // void drain(size_t idx, uint64_t now_ms, F &on_timeout) {
-    //     Entry e;
-    //     while (slots_q_[idx]->dequeue(e)) {
-    //         if (e.expire_ms <= now_ms) {
-    //             on_timeout(e.fd);
-    //         } else {
-    //             // 如果条目计算出来的槽正好是当前正在 drain 的槽，
-    //             // 那么把 expire_ms 向后推进一个 tick，避免被立即再次处理。
-    //             size_t target_idx = slot_index(e.expire_ms);
-    //             if (target_idx == idx) {
-    //                 e.expire_ms += tick_ms_;
-    //             }
-    //             add(e.fd, e.expire_ms);
-    //         }
-    //     }
-    // }
-
     template<typename F>
     void drain(size_t idx, uint64_t now_ms, F &on_timeout) {
         Entry e;
@@ -1202,7 +1156,6 @@ private:
     // [ET-CRITICAL] 批量 accept：循环最多 MAX_ACCEPT_BATCH 次，并在 EAGAIN 时退出
     void accept_loop(std::unordered_map<int, Connection *> &conns) {
         for (int i = 0; i < MAX_ACCEPT_BATCH; ++i) {
-            //for (;;) {
             sockaddr_in in{};
             socklen_t inlen = sizeof(in);
             int cfd = accept4(listen_fd_, (sockaddr *)&in, &inlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
@@ -1274,14 +1227,14 @@ private:
             }
         }
 
-        const size_t H = 1 + 4; // magic + body_len + endian + hdr_crc
+        const size_t H = 1 + 4; // magic + body_len
         while (true) {
-            if (conn->rx->readable_bytes() < H){     //检查可读字节是否少于包头长度
+            if (conn->rx->readable_bytes() < H){
                 bNeedRead = true;
                 break;
             }
             uint8_t hdrbuf[5];
-            size_t got = conn->rx->peek_bytes(hdrbuf, H);   //获取包头长度字节数据
+            size_t got = conn->rx->peek_bytes(hdrbuf, H);
             if (got < H){
                 assert(0);
                 break;
@@ -1290,7 +1243,6 @@ private:
             hdr.body_offset = hdrbuf[0];
             uint32_t bl;
             memcpy(&bl, hdrbuf + 1, 4);
-            //hdr.body_len = bswap32_u32(bl);
             hdr.body_len = bl;
             const uint32_t MAX_BODY = 16 * 1024 * 1024;
             if (hdr.body_len > MAX_BODY) {
@@ -1299,7 +1251,7 @@ private:
                 close_conn(conn, conns);
                 return;
             }
-            if (conn->rx->readable_bytes() < H + hdr.body_len){  //检查是否是个完整包
+            if (conn->rx->readable_bytes() < H + hdr.body_len){
                 bNeedRead = true;
                 break;
             }
@@ -1360,12 +1312,7 @@ private:
                 break;
             }
 
-            //std::string msg = "send ";
-            //msg.append((char*)iov.iov_base, iov.iov_len);
-            //logger_->debug(msg);
-
-            char* buf = (char*)iov.iov_base;
-            ssize_t n = ::write(conn->fd, /*iov.iov_base*/buf, /*iov.iov_len*/std::min((size_t)8, iov.iov_len));
+            ssize_t n = ::write(conn->fd, iov.iov_base, iov.iov_len);
             if (n > 0) {
                 g_metrics.tx_bytes += (uint64_t)n;
                 g_metrics.tx_pkts.fetch_add(1, std::memory_order_relaxed);
@@ -1414,6 +1361,7 @@ private:
         if (now_ms() - it->second->last_active_ms > idle_ms_) {     //判定是否超时
             g_metrics.timeouts.fetch_add(1, std::memory_order_relaxed);
             close_conn(it->second, conns);
+            g_metrics.in_ev.fetch_sub(1, std::memory_order_relaxed);
             logger_->debug("unexpect 6");
         } else {
             it->second->last_active_ms.store(now_ms(), std::memory_order_relaxed);
@@ -1441,10 +1389,10 @@ private:
                 continue;
             }
 
-            //logger_->debug("on_writable start1");
+            // 发送数据（尽可能写到 EAGAIN）
             on_writable(conn, conns);
-            //logger_->debug("on_writable end1");
 
+            // 业务的 stolen block 在上面已经拷贝到 out_buffer，可以释放
             pool_.release_ref(t.entry.blk);
         }
 
