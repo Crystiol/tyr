@@ -155,14 +155,9 @@ private:
     std::string func_;
 };
 
-/*
- * active_ms < idle_ms → 检查更频繁，超时触发更接近真实 idle_ms。
- * active_ms > idle_ms → 检查周期太长，会延迟发现超时，延迟时间最多等于 active_ms。
-*/
-
 // -------------------------- Config --------------------------
-static const size_t SMALL_BLOCK = 512; // 小块：协议头或小包512
-static const size_t LARGE_BLOCK = 8096; // 大块：主体或大包4096
+static const size_t SMALL_BLOCK = 4096; // 小块
+static const size_t LARGE_BLOCK = 4096*32; // 大块
 static const int MAX_ACCEPT_BATCH = 128; // 每次 accept 最多尝试次数
 static const size_t OUT_BUFFER_CAP = LARGE_BLOCK; // 出站缓冲区容量（单一 BufferBlock）
 static const uint64_t DEFAULT_IDLE_MS = 30 * 1000;
@@ -836,7 +831,7 @@ public:
 
     explicit TimingWheel(uint64_t tick_ms, size_t slots)
         : tick_ms_(tick_ms), slots_(normalize_pow2(slots)), slot_mask_(slots_ - 1),
-          initialized_(false), last_slot_index_(0) {
+        initialized_(false), last_slot_index_(0) {
         slots_q_.reserve(slots_);
         for (size_t i = 0; i < slots_; ++i){
             slots_q_.emplace_back(std::make_unique<MPMCRing<Entry>>(1 << 14));
@@ -932,7 +927,7 @@ struct ResponseTask {
 
 class TaskQueue {
 public:
-    TaskQueue() : q_(1 << 14) {}
+    TaskQueue() : q_(1 << 16) {}
 
     bool enqueue(const ResponseTask &t) { return q_.enqueue(t); }
     bool dequeue(ResponseTask &o) { return q_.dequeue(o); }
@@ -1100,13 +1095,13 @@ public:
                         g_metrics.in_ev.fetch_sub(1, std::memory_order_relaxed);
                         continue;
                     }
-                    if (events & EPOLLIN){
-                        g_metrics.in_ev.fetch_sub(1, std::memory_order_relaxed);
-                        on_readable(conn, conns); // [ET-CRITICAL] read 循环到 EAGAIN
-                    }
                     if (events & EPOLLOUT){
                         g_metrics.out_ev.fetch_sub(1, std::memory_order_relaxed);
                         on_writable(conn, conns); // [ET-CRITICAL] write 循环到 EAGAIN 或队列空
+                    }
+                    if (events & EPOLLIN){
+                        g_metrics.in_ev.fetch_sub(1, std::memory_order_relaxed);
+                        on_readable(conn, conns); // [ET-CRITICAL] read 循环到 EAGAIN
                     }
                 }
             }
@@ -1285,14 +1280,8 @@ private:
         }
 
         uint32_t events = EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
-        //if(bNeedRead/* || conn->out_empty()*/){
         events |= EPOLLIN;
         g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
-        //}
-        if (!conn->out_empty()){
-            events |= EPOLLOUT;
-            g_metrics.out_ev.fetch_add(1, std::memory_order_relaxed);
-        }
 
         if(!mod_event(epfd_, conn->fd, events))
             assert(0);
@@ -1322,6 +1311,7 @@ private:
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK){
                     bNeedWrite = true;
+                    assert(0);
                     break;
                 }
 
@@ -1331,25 +1321,6 @@ private:
             }
         }
 
-        // uint32_t events = EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
-        // g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
-        // if (!conn->out_empty()){
-        //     events |= EPOLLOUT;
-        //     g_metrics.out_ev.fetch_add(1, std::memory_order_relaxed);
-        // }
-        // else{
-        //     events |= EPOLLIN;
-        //     g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
-        // }
-
-        // if(!mod_event(epfd_, conn->fd, events))
-        //     assert(0);
-
-        // uint32_t events = EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
-        // if(conn->out_empty()){
-        //     events |= EPOLLIN;
-        //     g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
-        // }
 
         //logger_->debug("on_writable end");
     }
@@ -1391,6 +1362,15 @@ private:
 
             // 发送数据（尽可能写到 EAGAIN）
             on_writable(conn, conns);
+
+            if (!conn->out_empty()){
+                uint32_t events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
+                //g_metrics.in_ev.fetch_add(1, std::memory_order_relaxed);
+                g_metrics.out_ev.fetch_add(1, std::memory_order_relaxed);
+
+                if(!mod_event(epfd_, conn->fd, events))
+                    assert(0);
+            }
 
             // 业务的 stolen block 在上面已经拷贝到 out_buffer，可以释放
             pool_.release_ref(t.entry.blk);
@@ -1478,17 +1458,17 @@ int main(int argc, char **argv) {
 
     init_logger();
 
+    size_t max_conn = 1000;
     int ncpu = get_nprocs();
     ncpu = 2;
-    size_t small_blocks = (size_t)ncpu * 32 * 1000; // 可按内存和连接数调节
-    size_t large_blocks = (size_t)ncpu * 16 * 1000;
+    size_t small_blocks = (size_t)ncpu * max_conn * 4; // 可按内存和连接数调节
+    size_t large_blocks = (size_t)ncpu * max_conn / 4;
 
     LOG_INFO("ET-opt server starting on port %u with %d CPUs, small_blocks=%zu, "
              "large_blocks=%zu",
              port, ncpu, small_blocks, large_blocks);
 
     DualBufferPool pool(small_blocks, large_blocks);
-    size_t max_conn = 1000;
     RingBufferPool rpool(max_conn, pool);
     ConnectionPool cpool(max_conn, pool, rpool);
     size_t worker_threads = std::max(1, ncpu * 1);
