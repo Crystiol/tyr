@@ -430,23 +430,41 @@ public:
 
     // 消耗 n 字节（推进读指针并释放完整块）
     void consume(size_t n) {
+        // 诊断前后的可读字节数，便于断言
+        size_t before = readable_bytes();
         size_t remain = n;
         while (remain > 0 && head_) {
             size_t avail = (head_ == tail_) ? (tail_off_ - head_off_) : (head_->cap - head_off_);
             if (avail > remain) {
                 head_off_ += remain;
-                return;
+                remain = 0;
+                break;
             }
+            // avail <= remain 时，移除当前块
             remain -= avail;
             BufferBlock *old = head_;
-            head_ = old->next; //head指向下一块
-            pool_.release_ref(old); //回收已读完的块
-            head_off_ = 0; //下一块的起始地址必定为0，因为还没有被cosume
+            head_ = old->next;          // head 指向下一块
+            pool_.release_ref(old);     // 回收已读完的块
+            head_off_ = 0;              // 下一块的起始地址为 0
             if (!head_) {
                 tail_ = nullptr;
                 tail_off_ = 0;
                 break;
             }
+        }
+        size_t after = readable_bytes();
+        if (before >= n) {
+            size_t expect = before - n;
+            if (after != expect) {
+                logger_->debug("consume mismatch: before={} consume={} after={} (head_off={}, tail_off={})",
+                               before, n, after, head_off_, tail_off_);
+                // 不中断运行，打印堆栈级别的诊断（如果需要可 assert）
+                // assert(after == expect);
+            }
+        } else {
+            // 试图 consume 超过可读数据，这本身就是错误
+            logger_->debug("consume overrun: before={} requested={}", before, n);
+            // assert(false);
         }
     }
 
@@ -459,8 +477,7 @@ public:
         size_t cnt = 0;
         BufferBlock *cur = head_;
         size_t off = head_off_;
-        while (cur) {
-            //多个块的情形，剩余空间+新块已用
+        while (cur) {       //多个块的情形，剩余空间+新块已用
             if (cur == tail_) {
                 cnt += tail_off_ - off;
                 break;
@@ -474,7 +491,8 @@ public:
 
     // 返回单一 BufferBlock，拷贝数据，按 body_len 选择小/大块
     BufferBlock *steal_body_after(size_t header_len, size_t body_len) {
-        if (readable_bytes() < header_len + body_len)
+        size_t before = readable_bytes();
+        if (before < header_len + body_len)
             return nullptr;
 
         // 决定块大小
@@ -493,29 +511,59 @@ public:
                 off += skip;
                 skip = 0;
                 break;
-            }
+            } else if (avail == skip) {
+                // 恰好耗尽当前块，下一步从下一块开始拷贝
+                skip = 0;
+                cur = cur->next;
+                off = 0;
+                break;
+            } else {
             skip -= avail;
             cur = cur->next;
             off = 0;
+        	}
         }
 
         // 拷贝 body_len 到 new_block->data
         size_t remain = body_len;
         size_t copied = 0;
-        while (remain > 0 && cur) {
-            size_t avail = (cur == tail_) ? (tail_off_ - off) : (cur->cap - off);
+        BufferBlock *copy_src = cur;
+        size_t copy_off = off;
+        while (remain > 0 && copy_src) {
+            size_t avail = (copy_src == tail_) ? (tail_off_ - copy_off) : (copy_src->cap - copy_off);
+            if (avail == 0) {
+                // 不应该出现
+                logger_->debug("steal_body_after: zero avail while copying (remain={}, copied={}, tail_off={}, head_off={})", remain, copied, tail_off_, head_off_);
+                break;
+            }
             size_t take = std::min(avail, remain);
-            memcpy(new_block->data + copied, cur->data + off, take);
+            memcpy(new_block->data + copied, copy_src->data + copy_off, take);
             copied += take;
             remain -= take;
-            off += take;
-            if (off >= cur->cap) {
-                cur = cur->next;
-                off = 0;
+            copy_off += take;
+            if (copy_off >= copy_src->cap) {
+                copy_src = copy_src->next;
+                copy_off = 0;
             }
         }
 
+        if (copied != body_len) {
+            // 拷贝不完整：释放 new_block 并返回 nullptr
+            logger_->debug("steal_body_after copy incomplete: want={} got={} readable_before={}", body_len, copied, before);
+            pool_.release_ref(new_block);
+            return nullptr;
+        }
+
+        // 消耗 header_len + body_len
         consume(header_len + body_len);
+
+        size_t after = readable_bytes();
+        if (before - (header_len + body_len) != after) {
+            logger_->debug("steal_body_after: readable mismatch before={} after={} consumed={}", before, after, header_len + body_len);
+            // 进一步打印上下文
+            // assert(before - (header_len + body_len) == after);
+        }
+
         return new_block;
     }
 
@@ -613,8 +661,8 @@ public:
     int fd = -1;
     RingBuffer *rx = nullptr;
     BufferBlock *out_buffer = nullptr; // 替换 out_ring 为单一 BufferBlock
-    size_t out_offset = 0; // 当前写入偏移
-    size_t out_len = 0; // 当前有效数据长度
+    size_t write_pos = 0; // 写入位置（下一个写入索引）
+    size_t read_pos = 0;  // 已发送位置（下一个要发送的索引）
     std::atomic<uint64_t> last_active_ms{0};
 
     // ---------- 新增：串行写状态 ----------
@@ -633,11 +681,12 @@ public:
             p.release_ref(out_buffer);
             out_buffer = nullptr;
         }
-        out_offset = out_len = 0;
+        write_pos = read_pos = 0;
         last_active_ms = 0;
         writing.store(false);
     }
 
+    // 写入待发送数据（从 worker 投递过来）
     bool out_push(const OutEntry &e, DualBufferPool &pool) {
         if (!out_buffer) {
             out_buffer = pool.acquire(LARGE_BLOCK); //分配发送缓冲区
@@ -645,39 +694,38 @@ public:
                 assert(0);
                 return false;
             }
+            write_pos = read_pos = 0;
         }
-        if (out_offset + e.len > out_buffer->cap) {
+        // used = write_pos - read_pos
+        size_t used = write_pos - read_pos;
+        if (used + e.len > out_buffer->cap){
             assert(0);
             return false; // 缓冲区不足
         }
-        memcpy(out_buffer->data + out_offset, e.blk->data + e.offset, e.len);
-        out_offset += e.len;
-        out_len += e.len;
-        pool.retain(out_buffer); //add发送缓冲区计数，可以避免再次分配
+        memcpy(out_buffer->data + write_pos, e.blk->data + e.offset, e.len);
+        write_pos += e.len;
         return true;
     }
 
-    bool out_empty() const { return out_len == 0; }
+    bool out_empty() const { return write_pos == read_pos; }
 
     iovec out_peek() {
         if (out_empty() || !out_buffer)
             return {nullptr, 0};
-        return {out_buffer->data, out_len}; // 修复：返回真实长度
+        return {out_buffer->data + read_pos, write_pos - read_pos};
     }
 
     void out_advance(size_t bytes_written, DualBufferPool &pool) {
-        if (bytes_written >= out_len) {
-            out_len = 0;
-            out_offset = 0;
+        read_pos += bytes_written;
+        if (read_pos >= write_pos) {
+            // 全部发送完毕，释放缓冲
+            read_pos = write_pos = 0;
             if (out_buffer) {
-                pool.release_ref(out_buffer); //回收发送缓冲区
-                //out_buffer = nullptr;       //如果out_push中调用了pool.retain(out_buffer)，则不应该赋空
+                pool.release_ref(out_buffer);
+                out_buffer = nullptr;
             }
-        } else {
-            out_len -= bytes_written;
-            memmove(out_buffer->data, out_buffer->data + bytes_written, out_len);
-            out_offset = out_len;
         }
+        // 注意：不使用 memmove；保持 read_pos/write_pos 语义
     }
 };
 
