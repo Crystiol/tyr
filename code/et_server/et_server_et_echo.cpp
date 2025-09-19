@@ -415,6 +415,20 @@ struct PacketHeader {
 #pragma pack(pop)
 
 // -------------------------- RingBuffer（零拷贝入站，支持双层块） --------------------------
+/*
+常见 ring buffer 里“少 1 字节”的原因：
+在很多“环形缓冲区（circular buffer）”的实现里，会故意浪费掉 1 个字节：
+这样能区分 满（full） 和 空（empty） 两种状态。
+因为如果允许写满，那么 head == tail 可能既代表“满”也可能代表“空”，就要额外一个标志位来区分。
+所以一些实现干脆只允许最多写 cap-1 个字节，把最后一个字节当成哨兵。
+
+但是！你这里的 RingBuffer 并不是传统的单缓冲区环形队列，而是：
+一个由 BufferBlock 链表拼接起来的“分段环形”结构；
+每个 BufferBlock 本身用 head_off_ / tail_off_ 来指示读写位置；
+readable_bytes()、consume()、produce() 都是靠偏移量来算可读可写的；
+没有依赖 head == tail 来判断状态。
+所以你完全可以用满 cap 个字节，不需要浪费掉最后 1 个字节。
+*/
 class RingBuffer {
 public:
     RingBuffer(DualBufferPool &pool)
@@ -447,13 +461,13 @@ public:
     // 获取可写区域（hint 参数决定分配小/大块）,写满一个块后才会写下一个扩展块
     iovec writable_region(size_t hint = SMALL_BLOCK) {
         ensure_tail(hint);
-        return iovec{tail_->data + tail_off_, tail_->cap - tail_off_ - 1};
+        return iovec{tail_->data + tail_off_, tail_->cap - tail_off_/* - 1*/};
     }
 
     // 标记已写入 n 字节，根据需要扩展块
     void produce(size_t n) {
         tail_off_ += n;
-        if (tail_off_ >= tail_->cap - 1) {
+        if (tail_off_ >= tail_->cap/* - 1*/) {
             append_block(SMALL_BLOCK);
             tail_off_ = 0;
         }
@@ -648,7 +662,7 @@ private:
     }
 
     void ensure_tail(size_t hint) {
-        if (!tail_ || tail_off_ >= tail_->cap - 1) {
+        if (!tail_ || tail_off_ >= tail_->cap/* - 1*/) {
             append_block(hint);     //未分配块或块已满则分配新块
             tail_off_ = 0;
         }
