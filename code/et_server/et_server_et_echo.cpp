@@ -1294,22 +1294,22 @@ private:
             }
 
             // consume header
-            size_t before_consume = conn->rx->readable_bytes();
+            /*size_t before_consume = conn->rx->readable_bytes();
             conn->rx->consume(H);
             size_t after_consume = conn->rx->readable_bytes();
             if (before_consume - H != after_consume) {
                 logger_->debug("consume header mismatch: before={} after={} H={}", before_consume, after_consume, H);
-            }
+            }*/
 
             // 读包体阶段提示使用大块以提升吞吐，并不一定能实现使用大块读
             (void)conn->rx->writable_region(std::min<size_t>(
                 LARGE_BLOCK, std::max<size_t>(SMALL_BLOCK, hdr.body_len)));
 
             // steal body 拷贝到新块
-            BufferBlock *stolen = conn->rx->steal_body_after(0, hdr.body_len);
+            BufferBlock *stolen = conn->rx->steal_body_after(0, H+hdr.body_len);
             if (!stolen) {
                 g_metrics.drops.fetch_add(1, std::memory_order_relaxed);
-                logger_->debug("steal failed for fd={} want_len={} readable={}", conn->fd, hdr.body_len, conn->rx->readable_bytes());
+                logger_->debug("steal failed for fd={} want_len={} readable={}", conn->fd, H+hdr.body_len, conn->rx->readable_bytes());
                 break;
             }
             g_metrics.rx_pkts.fetch_add(1, std::memory_order_relaxed);
