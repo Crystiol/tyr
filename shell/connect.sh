@@ -34,7 +34,7 @@ log "Starting temporary system tuning for epoll server testing..."
 # -------------------------
 apply_sysctl "fs/file-max" "1048576"
 apply_sysctl "fs/epoll/max_user_watches" "1048576"
-ulimit -n 200000
+ulimit -n 65536
 current_ulimit=$(ulimit -n)
 log "Set ulimit -n = $current_ulimit"
 
@@ -47,7 +47,7 @@ apply_sysctl "net/ipv4/tcp_tw_reuse" "1"
 apply_sysctl "net/ipv4/tcp_fin_timeout" "15"
 apply_sysctl "net/ipv4/tcp_rmem" "4096 87380 8388608"
 apply_sysctl "net/ipv4/tcp_wmem" "4096 65536 8388608"
-apply_sysctl "net/ipv4/tcp_max_syn_backlog" "65536"
+apply_sysctl "net/ipv4/tcp_max_syn_backlog" "8192"
 apply_sysctl "net/core/netdev_max_backlog" "10000"
 
 # -------------------------
@@ -138,6 +138,33 @@ log "Verified ulimit -n = $current_ulimit"
 log "Temporary system tuning completed. Ready for epoll server testing."
 log "Note: These changes are temporary and will revert on reboot."
 
-exec ./et_server/build/Desktop_Qt_5_15_2_GCC_64bit-Debug/et_server
+#exec ./et_server/build/Desktop_Qt_5_15_2_GCC_64bit-Debug/et_server
+#exec ./pingpong_client ./pingpong_client -p 9000 -t 1 -d 60 -c 20000 -H 127.0.0.2
+
+ip addr add 127.0.0.2/8 dev lo
+ip addr add 127.0.0.3/8 dev lo
+ip addr add 127.0.0.4/8 dev lo
+ip addr add 127.0.0.5/8 dev lo
+ip addr show dev lo
+
+log "Starting multiple pingpong_client instances..."
+
+for i in $(seq 1 5); do
+    ip="127.0.0.$i"
+    log "Launching pingpong_client with IP $ip"
+
+    # 每个客户端分 8 批发送，每批 2000 个连接
+    for batch in $(seq 1 8); do
+        start_conn=$(( (batch - 1) * 2000 + 1 ))
+        log "Client $ip: batch $batch starting connections $start_conn to $((start_conn + 1999))"
+        
+        ./client "$ip" 127.0.0.1 9000 2000 &
+        sleep 1   # 每批间隔 1 秒，可根据需要调整
+    done
+done
+
+log "All pingpong_client instances started."
+#sleep 10000
 
 exit 0
+
