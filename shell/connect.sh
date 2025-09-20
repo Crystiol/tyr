@@ -4,6 +4,8 @@
 # 注意：这些更改在系统重启后会失效
 # 执行前需以 root 权限运行：sudo ./netopt.sh
 
+pkill client
+
 # 检查是否以 root 权限运行
 if [ "$EUID" -ne 0 ]; then
     echo "Error: Please run this script as root (use sudo)"
