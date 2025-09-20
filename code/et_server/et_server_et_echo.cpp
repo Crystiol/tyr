@@ -1706,3 +1706,108 @@ int main(int argc, char **argv) {
     return 0;
 }
 #endif
+
+//避免惊群的多线程版本
+#if 0
+int main(int argc, char **argv) {
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    uint16_t port = 9000;
+    uint16_t metrics_port = 9100;
+    if (argc > 1)
+        port = (uint16_t)atoi(argv[1]);
+    if (argc > 2)
+        metrics_port = (uint16_t)atoi(argv[2]);
+
+    init_logger();
+
+    int ncpu = get_nprocs();
+    if (ncpu < 1) ncpu = 1;
+
+    size_t small_blocks = (size_t)ncpu * 32 * 10;
+    size_t large_blocks = (size_t)ncpu * 16 * 10;
+    DualBufferPool pool(small_blocks, large_blocks);
+    size_t max_conn = 10000;
+    RingBufferPool rpool(max_conn, pool);
+    ConnectionPool cpool(max_conn, pool, rpool);
+    size_t worker_threads = std::max(1, ncpu * 1);
+    WorkerPool workers(worker_threads);
+
+    LOG_INFO("ET-opt server (multi-thread SO_REUSEPORT) starting on port %u with %d threads",
+             port, ncpu);
+
+    // 每个线程有自己独立的 listen_fd
+    std::vector<std::thread> reactor_threads;
+    std::vector<std::unique_ptr<Reactor>> reactors;
+
+    for (int i = 0; i < ncpu; ++i) {
+        int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (listen_fd < 0)
+            die("socket");
+
+        set_tcp_options(listen_fd);  // 内部已包含 SO_REUSEPORT
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind(listen_fd, (sockaddr *)&addr, sizeof addr) < 0)
+            die("bind");
+        if (listen(listen_fd, 65535) < 0)
+            die("listen");
+
+        reactors.emplace_back(new Reactor(i, listen_fd, pool, cpool, workers,
+                                          DEFAULT_IDLE_MS, DEFAULT_ACTIVE_MS));
+        reactors.back()->set_metrics_port(metrics_port);
+        reactor_threads.emplace_back([&r = reactors.back()]() { r->run(); });
+    }
+
+    // metrics 打印线程
+    std::thread metrics_printer([&] {
+        uint64_t last_rx = 0, last_tx = 0;
+        auto last = steady_clock::now();
+        while (!g_terminate.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(4));
+            auto now = steady_clock::now();
+            double s = duration_cast<duration<double>>(now - last).count();
+            last = now;
+            uint64_t rx = g_metrics.rx_bytes.load(), tx = g_metrics.tx_bytes.load();
+            double rxrate = (rx - last_rx) / s, txrate = (tx - last_tx) / s;
+            last_rx = rx;
+            last_tx = tx;
+
+            logger_->debug(
+                    "acc={} cls={} rx={} tx={} rx/s={:.2f}B "
+                    "tx/s={:.2f}B pkts(rx={} tx={}) drop={} err={} to={} sp={} lp={} rp={} cp={} in={} out={}",
+                    g_metrics.accepted.load(),
+                    g_metrics.closed.load(),
+                    rx, tx, rxrate, txrate,
+                    g_metrics.rx_pkts.load(),
+                    g_metrics.tx_pkts.load(),
+                    g_metrics.drops.load(),
+                    g_metrics.parse_errors.load(),
+                    g_metrics.timeouts.load(),
+                    g_metrics.s_pool.load(),
+                    g_metrics.l_pool.load(),
+                    g_metrics.r_pool.load(),
+                    g_metrics.c_pool.load(),
+                    g_metrics.in_ev.load(),
+                    g_metrics.out_ev.load());
+        }
+    });
+
+    while (!g_terminate.load())
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    LOG_INFO("shutdown requested, stopping reactors");
+    for (auto &r : reactors)
+        r->stop();
+    for (auto &t : reactor_threads)
+        if (t.joinable())
+            t.join();
+    metrics_printer.join();
+    LOG_INFO("server stopped");
+    return 0;
+}
+#endif
