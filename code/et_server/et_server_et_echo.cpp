@@ -1490,6 +1490,7 @@ private:
 };
 
 // -------------------------- 主程序 --------------------------
+#if MULTITHREAD
 static std::atomic<bool> g_terminate{false};
 
 static void signal_handler(int sig) {
@@ -1600,3 +1601,108 @@ int main(int argc, char **argv) {
     LOG_INFO("server stopped");
     return 0;
 }
+#endif
+
+#if MULTIPROCESS
+static std::atomic<bool> g_terminate{false};
+
+static void signal_handler(int sig) {
+    fprintf(stderr, "[INFO] signal %d, terminating\n", sig);
+    g_terminate.store(true);
+}
+
+int main(int argc, char **argv) {
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    uint16_t port = 9000;
+    if (argc > 1)
+        port = (uint16_t)atoi(argv[1]);
+
+    int ncpu = get_nprocs();
+    if (ncpu < 1) ncpu = 1;
+
+    fprintf(stdout, "[INFO] ET-opt multi-process server starting on port %u with %d workers\n",
+            port, ncpu);
+
+    std::vector<pid_t> children;
+
+    for (int i = 0; i < ncpu; i++) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            exit(1);
+        }
+
+        if (pid == 0) {
+            // ---- 子进程逻辑 ----
+
+            // 每个子进程都有自己独立的 listen_fd
+            int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+            if (listen_fd < 0) {
+                perror("socket");
+                exit(1);
+            }
+
+            int one = 1;
+            setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#ifdef SO_REUSEPORT
+            setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#endif
+            setsockopt(listen_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(port);
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            if (bind(listen_fd, (sockaddr *)&addr, sizeof addr) < 0) {
+                perror("bind");
+                exit(1);
+            }
+            if (listen(listen_fd, 65535) < 0) {
+                perror("listen");
+                exit(1);
+            }
+
+            // 每个进程内自己建 buffer pool / connection pool
+            size_t small_blocks = 32 * 10;
+            size_t large_blocks = 16 * 10;
+            DualBufferPool pool(small_blocks, large_blocks);
+            size_t max_conn = 10000;   // 每进程最大连接数
+            RingBufferPool rpool(max_conn, pool);
+            ConnectionPool cpool(max_conn, pool, rpool);
+            WorkerPool workers(1);
+
+            Reactor reactor(i, listen_fd, pool, cpool, workers,
+                            DEFAULT_IDLE_MS, DEFAULT_ACTIVE_MS);
+            reactor.run();  // 阻塞运行
+
+            exit(0); // 子进程结束
+        } else {
+            // ---- 父进程逻辑 ----
+            children.push_back(pid);
+        }
+    }
+
+    // 父进程只做监控和信号处理
+    while (!g_terminate.load()) {
+        int status = 0;
+        pid_t dead = waitpid(-1, &status, WNOHANG);
+        if (dead > 0) {
+            fprintf(stderr, "[WARN] child %d exited\n", dead);
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+
+    fprintf(stdout, "[INFO] shutting down, killing workers\n");
+    for (pid_t c : children) {
+        kill(c, SIGTERM);
+    }
+    for (pid_t c : children) {
+        waitpid(c, nullptr, 0);
+    }
+    fprintf(stdout, "[INFO] server stopped\n");
+    return 0;
+}
+#endif
