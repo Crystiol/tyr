@@ -1,5 +1,6 @@
 #!/bin/bash
 
+# 生成子工程CMakeLists.txt：gen_project.sh tlpi-dist
 # 检查是否传入了目录参数
 if [ -z "$1" ]; then
     echo "Usage: $0 <root_directory>"

@@ -1,6 +1,7 @@
 #!/bin/bash
 set -e
 
+# 添加子工程：gen_subdirs.sh tlpi-dist
 if [ $# -lt 1 ]; then
     echo "用法: $0 <目录>"
     exit 1
