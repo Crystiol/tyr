@@ -160,7 +160,7 @@ for i in $(seq 1 5); do
         start_conn=$(( (batch - 1) * 2000 + 1 ))
         log "Client $ip: batch $batch starting connections $start_conn to $((start_conn + 1999))"
         
-        ./client "$ip" 127.0.0.1 9000 2000 &
+        ./connect_test "$ip" 127.0.0.1 9000 2000 &
         sleep 1   # 每批间隔 1 秒，可根据需要调整
     done
 done
